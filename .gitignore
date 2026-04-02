@@ -1,2 +1,25 @@
 /target
 Cargo.lock
+
+# Local cargo config (contains machine-specific paths)
+.cargo/config.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Database files (runtime)
+*.db
+*.db-wal
+*.db-shm

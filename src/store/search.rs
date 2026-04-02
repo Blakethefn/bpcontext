@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 /// A search result with relevance metadata
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SearchResult {
     pub title: String,
     pub content: String,
@@ -313,6 +314,7 @@ fn escape_sql(s: &str) -> String {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct RankedResult {
     title: String,
     content: String,

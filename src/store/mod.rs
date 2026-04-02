@@ -105,12 +105,14 @@ impl ContentStore {
     }
 
     /// Get the underlying connection (for advanced queries)
+    #[allow(dead_code)]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct IndexResult {
     pub source_id: i64,
     pub chunk_count: u32,
@@ -118,6 +120,7 @@ pub struct IndexResult {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SourceInfo {
     pub id: i64,
     pub label: String,

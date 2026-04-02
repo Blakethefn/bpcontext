@@ -6,6 +6,7 @@ use crate::truncate::truncate_output;
 
 /// Result of executing a command
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ExecResult {
     pub stdout: String,
     pub stderr: String,

@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 /// Event priority levels
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum Priority {
     Low = 1,
     Normal = 2,
@@ -80,6 +81,7 @@ pub fn evict_if_needed(conn: &Connection, max_events: u32) -> Result<u32> {
 }
 
 /// Count total events
+#[allow(dead_code)]
 pub fn event_count(conn: &Connection) -> Result<u32> {
     let count: u32 = conn.query_row(
         "SELECT COUNT(*) FROM events",
@@ -97,6 +99,7 @@ fn compute_hash(data: &str) -> String {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct EventRecord {
     pub id: i64,
     pub event_type: String,

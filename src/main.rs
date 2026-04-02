@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Search { query, source, content_type, limit }) => {
-            let config = Config::load()?;
+            let _config = Config::load()?;
             let store = ContentStore::open(&project_dir())?;
 
             stats::record_search();

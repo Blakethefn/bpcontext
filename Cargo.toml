@@ -3,6 +3,12 @@ name = "bpcontext"
 version = "0.1.0"
 edition = "2021"
 description = "Context window optimization CLI and MCP server for Claude Code"
+license = "MIT"
+repository = "https://github.com/Blakethefn/bpcontext"
+homepage = "https://github.com/Blakethefn/bpcontext"
+authors = ["Blake Paulson"]
+keywords = ["context", "llm", "mcp", "indexing", "claude"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # CLI

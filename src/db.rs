@@ -53,6 +53,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 }
 
 /// List all content DB files with their modification times
+#[allow(dead_code)]
 pub fn list_content_dbs() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
     let dir = data_dir()?.join("content");
     if !dir.exists() {
@@ -71,6 +72,7 @@ pub fn list_content_dbs() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
 }
 
 /// Delete content DBs older than the given number of days
+#[allow(dead_code)]
 pub fn cleanup_stale_dbs(stale_days: u64) -> Result<u32> {
     let cutoff = std::time::SystemTime::now()
         - std::time::Duration::from_secs(stale_days * 86400);
