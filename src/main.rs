@@ -6,6 +6,7 @@ mod embedder;
 mod executor;
 mod fetch;
 mod hooks;
+mod indexdir;
 mod mcp;
 mod promote;
 mod session;
@@ -382,6 +383,28 @@ fn main() -> Result<()> {
                 }
             }
 
+            Ok(())
+        }
+
+        Some(Commands::IndexDir { path, glob, label_prefix }) => {
+            let store = ContentStore::open(&project_dir())?;
+            let result = indexdir::index_directory(
+                &store,
+                &path,
+                glob.as_deref(),
+                &label_prefix,
+            )?;
+            stats::record_indexed(result.total_bytes);
+            println!(
+                "{} Indexed {} files ({} chunks, {} skipped)",
+                "->".green(),
+                result.files_indexed,
+                result.total_chunks,
+                result.files_skipped,
+            );
+            for err in &result.walk_errors {
+                eprintln!("{} {}", "warn:".yellow(), err);
+            }
             Ok(())
         }
 

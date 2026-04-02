@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "bpcontext")]
@@ -95,4 +96,16 @@ pub enum Commands {
 
     /// Show context budget and per-source breakdown
     ContextStatus,
+
+    /// Index all files in a directory
+    IndexDir {
+        /// Directory path to index
+        path: PathBuf,
+        /// Glob pattern to filter files (e.g. "*.rs", "*.py"). Matches at any depth by default.
+        #[arg(short, long)]
+        glob: Option<String>,
+        /// Prefix for all labels (e.g. "myproject/")
+        #[arg(short, long, default_value = "")]
+        label_prefix: String,
+    },
 }

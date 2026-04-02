@@ -166,7 +166,7 @@ pub(crate) mod tests {
 
     #[test]
     fn embedding_bytes_roundtrip() {
-        let original = vec![1.0f32, -2.5, 3.14, 0.0, -0.001];
+        let original = vec![1.0f32, -2.5, 3.125, 0.0, -0.001];
         let bytes = embedding_to_bytes(&original);
         let recovered = bytes_to_embedding(&bytes);
 
