@@ -5,3 +5,30 @@ edition = "2021"
 description = "Context window optimization CLI and MCP server for Claude Code"
 
 [dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# SQLite with FTS5
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Config & paths
+dirs = "6"
+
+# Utils
+anyhow = "1"
+chrono = "0.4"
+colored = "3"
+regex = "1"
+sha2 = "0.10"
+
+# Fuzzy matching
+strsim = "0.11"
+
+# HTTP fetch
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+htmd = "0.1"
