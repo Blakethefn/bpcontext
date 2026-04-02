@@ -10,6 +10,10 @@ authors = ["Blake Paulson"]
 keywords = ["context", "llm", "mcp", "indexing", "claude"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -38,3 +42,10 @@ strsim = "0.11"
 # HTTP fetch
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
 htmd = "0.1"
+
+# Embeddings (Candle ML)
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+tokenizers = "0.21"
+hf-hub = "0.4"

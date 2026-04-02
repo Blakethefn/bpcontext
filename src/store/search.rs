@@ -2,6 +2,8 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 
+use crate::embedder::{self, Embed};
+
 /// A search result with relevance metadata
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -14,30 +16,66 @@ pub struct SearchResult {
     pub source: String,
 }
 
-/// Multi-layer search: BM25 → trigram → Levenshtein correction → RRF fusion
+/// Weight configuration for RRF layer blending
+pub struct SearchWeights {
+    pub keyword_weight: f64,
+    pub vector_weight: f64,
+}
+
+impl Default for SearchWeights {
+    fn default() -> Self {
+        Self {
+            keyword_weight: 1.0,
+            vector_weight: 1.0,
+        }
+    }
+}
+
+/// Multi-layer search: BM25 → trigram → Levenshtein → vector → RRF fusion
 pub fn multi_layer_search(
     conn: &Connection,
     query: &str,
     limit: u32,
     source_filter: Option<&str>,
     type_filter: Option<&str>,
+    embedder: Option<&dyn Embed>,
+    weights: &SearchWeights,
 ) -> Result<Vec<SearchResult>> {
     let mut all_results: HashMap<String, ScoredResult> = HashMap::new();
 
     // Layer 1: FTS5 BM25 with Porter stemming
     let bm25_results = fts5_bm25_search(conn, query, limit, source_filter, type_filter)?;
-    merge_results(&mut all_results, &bm25_results, 1);
+    merge_results(&mut all_results, &bm25_results, weights.keyword_weight);
 
     // Layer 2: Trigram search (if BM25 returned fewer than limit)
     if bm25_results.len() < limit as usize {
         let trigram_results = trigram_search(conn, query, limit, source_filter, type_filter)?;
-        merge_results(&mut all_results, &trigram_results, 2);
+        merge_results(&mut all_results, &trigram_results, weights.keyword_weight);
     }
 
     // Layer 3: Levenshtein fuzzy correction (if still too few results)
     if all_results.len() < limit as usize {
         let fuzzy_results = fuzzy_search(conn, query, limit, source_filter, type_filter)?;
-        merge_results(&mut all_results, &fuzzy_results, 3);
+        merge_results(&mut all_results, &fuzzy_results, weights.keyword_weight);
+    }
+
+    // Layer 4: Vector similarity (always runs if embedder available)
+    if let Some(emb) = embedder {
+        match emb.embed_one(query) {
+            Ok(query_embedding) => {
+                let vector_results = vector_search(
+                    conn,
+                    &query_embedding,
+                    limit,
+                    source_filter,
+                    type_filter,
+                )?;
+                merge_results(&mut all_results, &vector_results, weights.vector_weight);
+            }
+            Err(e) => {
+                eprintln!("[bpcontext] query embedding failed, skipping vector layer: {e}");
+            }
+        }
     }
 
     // RRF fusion scoring + proximity boost
@@ -222,16 +260,90 @@ fn extract_index_terms(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     }
 }
 
-/// Merge ranked results into the accumulator using Reciprocal Rank Fusion
+/// Brute-force vector similarity search over stored embeddings.
+///
+/// Computes dot-product similarity (embeddings are pre-normalized at index time,
+/// so dot product equals cosine similarity). Returns results ranked by similarity.
+fn vector_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: u32,
+    source_filter: Option<&str>,
+    type_filter: Option<&str>,
+) -> Result<Vec<RankedResult>> {
+    // Build query to load embeddings with chunk metadata
+    let mut sql = String::from(
+        "SELECT ce.chunk_rowid, ce.embedding,
+                c.title, c.content, c.content_type, c.source_id,
+                COALESCE(s.label, '') as source_label
+         FROM chunk_embeddings ce
+         JOIN chunks c ON c.rowid = ce.chunk_rowid
+         LEFT JOIN sources s ON c.source_id = s.id
+         WHERE 1=1"
+    );
+
+    if let Some(tf) = type_filter {
+        sql.push_str(&format!(" AND c.content_type = '{}'", escape_sql(tf)));
+    }
+    if let Some(sf) = source_filter {
+        sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
+    }
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut scored: Vec<(f32, RankedResult)> = stmt
+        .query_map([], |row| {
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((
+                blob,
+                RankedResult {
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                    content_type: row.get(4)?,
+                    source_id: row.get(5)?,
+                    rank: 0.0, // will be set after sorting
+                    source_label: row.get(6)?,
+                },
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(blob, result)| {
+            let embedding = embedder::bytes_to_embedding(&blob);
+            let similarity = dot_product(query_embedding, &embedding);
+            (similarity, result)
+        })
+        .collect();
+
+    // Sort by similarity descending
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit as usize);
+
+    // Convert to RankedResult with rank set for RRF
+    Ok(scored
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (_, mut result))| {
+            result.rank = rank as f64;
+            result
+        })
+        .collect())
+}
+
+/// Dot product of two vectors. With L2-normalized vectors, this equals cosine similarity.
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Merge ranked results into the accumulator using Reciprocal Rank Fusion.
+/// The `weight` multiplier scales the RRF contribution of this layer.
 fn merge_results(
     acc: &mut HashMap<String, ScoredResult>,
     results: &[RankedResult],
-    _layer: u32,
+    weight: f64,
 ) {
     const K: f64 = 60.0;
 
     for (rank, result) in results.iter().enumerate() {
-        let rrf_score = 1.0 / (K + rank as f64 + 1.0);
+        let rrf_score = weight * (1.0 / (K + rank as f64 + 1.0));
         let key = format!("{}:{}", result.source_id, result.title);
 
         acc.entry(key)
@@ -360,5 +472,218 @@ mod tests {
     #[test]
     fn test_sanitize_trigram_query() {
         assert_eq!(sanitize_trigram_query("hello"), "\"hello\"");
+    }
+
+    #[test]
+    fn test_dot_product_identical_unit_vectors() {
+        let a = vec![1.0, 0.0, 0.0];
+        assert!((dot_product(&a, &a) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dot_product_orthogonal_vectors() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        assert!((dot_product(&a, &b)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dot_product_opposite_vectors() {
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![-1.0, 0.0, 0.0];
+        assert!((dot_product(&a, &b) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dot_product_normalized() {
+        // Two similar-ish vectors, both L2-normalized
+        let mut a = vec![3.0f32, 4.0];
+        let norm_a = (a[0] * a[0] + a[1] * a[1]).sqrt();
+        a.iter_mut().for_each(|v| *v /= norm_a);
+
+        let mut b = vec![4.0f32, 3.0];
+        let norm_b = (b[0] * b[0] + b[1] * b[1]).sqrt();
+        b.iter_mut().for_each(|v| *v /= norm_b);
+
+        let sim = dot_product(&a, &b);
+        // cos(angle between [3,4] and [4,3]) = 24/25 = 0.96
+        assert!((sim - 0.96).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_merge_results_with_weight() {
+        let mut acc: HashMap<String, ScoredResult> = HashMap::new();
+        let results = vec![RankedResult {
+            title: "test".to_string(),
+            content: "content".to_string(),
+            content_type: "prose".to_string(),
+            source_id: 1,
+            rank: 0.0,
+            source_label: "src".to_string(),
+        }];
+
+        // Weight 1.0: rank 0 → 1/(60+0+1) = 0.01639...
+        merge_results(&mut acc, &results, 1.0);
+        let score_w1 = acc.values().next().unwrap().rrf_score;
+
+        let mut acc2: HashMap<String, ScoredResult> = HashMap::new();
+        merge_results(&mut acc2, &results, 2.0);
+        let score_w2 = acc2.values().next().unwrap().rrf_score;
+
+        assert!((score_w2 - 2.0 * score_w1).abs() < 1e-10);
+    }
+
+    /// Helper: set up an in-memory DB with schema, insert chunks + embeddings
+    fn setup_vector_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::schema::init_content_schema(&conn).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sources (label, indexed_at, chunk_count) VALUES (?1, ?2, 3)",
+            rusqlite::params!["test-source", now],
+        ).unwrap();
+
+        // Insert 3 chunks with different content
+        let chunks = [
+            ("authentication", "login flow with JWT tokens and session management"),
+            ("database schema", "SQL tables with indexes and foreign keys"),
+            ("error handling", "retry logic with exponential backoff and circuit breaker"),
+        ];
+
+        for (title, content) in &chunks {
+            conn.execute(
+                "INSERT INTO chunks (title, content, content_type, source_id) VALUES (?1, ?2, 'prose', 1)",
+                rusqlite::params![title, content],
+            ).unwrap();
+
+            let rowid = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO chunks_trigram (title, content, content_type, source_id) VALUES (?1, ?2, 'prose', 1)",
+                rusqlite::params![title, content],
+            ).unwrap();
+
+            // Generate a simple deterministic embedding from the content
+            let text = format!("{title} {content}");
+            let embedding = test_embedding(&text);
+            let blob = embedder::embedding_to_bytes(&embedding);
+
+            conn.execute(
+                "INSERT INTO chunk_embeddings (chunk_rowid, embedding, dim) VALUES (?1, ?2, ?3)",
+                rusqlite::params![rowid, blob, embedding.len() as i32],
+            ).unwrap();
+        }
+
+        conn
+    }
+
+    /// Generate a simple test embedding (small dim for speed)
+    fn test_embedding(text: &str) -> Vec<f32> {
+        let dim = 16;
+        let mut vec = vec![0.0f32; dim];
+        for (i, byte) in text.bytes().enumerate() {
+            vec[i % dim] += byte as f32;
+        }
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        for val in &mut vec {
+            *val /= norm;
+        }
+        vec
+    }
+
+    #[test]
+    fn test_vector_search_returns_results() {
+        let conn = setup_vector_test_db();
+        let query_emb = test_embedding("authentication login JWT");
+
+        let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
+        assert!(!results.is_empty(), "vector search should return results");
+        assert!(results.len() <= 3, "should not exceed chunk count");
+    }
+
+    #[test]
+    fn test_vector_search_ranks_by_similarity() {
+        let conn = setup_vector_test_db();
+        // Query very close to "authentication" chunk embedding
+        let query_emb = test_embedding("authentication login flow with JWT tokens and session management");
+
+        let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
+        assert!(!results.is_empty());
+        // First result should be the "authentication" chunk (most similar)
+        assert_eq!(results[0].title, "authentication");
+    }
+
+    #[test]
+    fn test_vector_search_respects_limit() {
+        let conn = setup_vector_test_db();
+        let query_emb = test_embedding("anything");
+
+        let results = vector_search(&conn, &query_emb, 1, None, None).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_vector_search_source_filter() {
+        let conn = setup_vector_test_db();
+        let query_emb = test_embedding("anything");
+
+        // Filter by existing source
+        let results = vector_search(&conn, &query_emb, 10, Some("test-source"), None).unwrap();
+        assert!(!results.is_empty());
+
+        // Filter by non-existing source
+        let results = vector_search(&conn, &query_emb, 10, Some("nonexistent"), None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_vector_search_type_filter() {
+        let conn = setup_vector_test_db();
+        let query_emb = test_embedding("anything");
+
+        // Filter by existing type
+        let results = vector_search(&conn, &query_emb, 10, None, Some("prose")).unwrap();
+        assert!(!results.is_empty());
+
+        // Filter by non-existing type
+        let results = vector_search(&conn, &query_emb, 10, None, Some("code")).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_vector_search_empty_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::schema::init_content_schema(&conn).unwrap();
+
+        let query_emb = vec![0.1f32; 16];
+        let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_multi_layer_search_without_embedder() {
+        let conn = setup_vector_test_db();
+        let weights = SearchWeights::default();
+
+        // Should work fine without embedder — keyword layers only
+        let results = multi_layer_search(
+            &conn, "authentication", 10, None, None, None, &weights,
+        ).unwrap();
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_multi_layer_search_with_mock_embedder() {
+        use crate::embedder::tests::MockEmbedder;
+
+        let conn = setup_vector_test_db();
+        let weights = SearchWeights::default();
+        let embedder = MockEmbedder::new();
+
+        let results = multi_layer_search(
+            &conn, "authentication", 10, None, None, Some(&embedder), &weights,
+        ).unwrap();
+        assert!(!results.is_empty());
     }
 }

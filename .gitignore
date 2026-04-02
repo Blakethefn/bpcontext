@@ -23,3 +23,11 @@ Thumbs.db
 *.db
 *.db-wal
 *.db-shm
+
+# Model weights (downloaded at runtime via hf-hub)
+models/
+*.safetensors
+*.bin
+*.ot
+*.onnx
+tokenizer.json

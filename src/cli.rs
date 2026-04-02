@@ -89,4 +89,10 @@ pub enum Commands {
 
     /// List indexed sources
     Sources,
+
+    /// Generate embeddings for chunks that don't have one yet
+    EmbedBackfill,
+
+    /// Show context budget and per-source breakdown
+    ContextStatus,
 }

@@ -29,6 +29,13 @@ pub fn init_content_schema(conn: &Connection) -> Result<()> {
              content_type,
              source_id UNINDEXED,
              tokenize = 'trigram'
+         );
+
+         -- Vector embeddings for semantic search (Phase 1)
+         CREATE TABLE IF NOT EXISTS chunk_embeddings (
+             chunk_rowid INTEGER PRIMARY KEY,
+             embedding BLOB NOT NULL,
+             dim INTEGER NOT NULL DEFAULT 384
          );"
     )?;
     Ok(())
@@ -46,6 +53,16 @@ pub fn init_session_schema(conn: &Connection) -> Result<()> {
              data_hash TEXT,
              created_at TEXT NOT NULL,
              UNIQUE(data_hash)
+         );
+
+         -- Context ledger for tracking what was returned to the agent (Phase 3)
+         CREATE TABLE IF NOT EXISTS context_ledger (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             chunk_rowid INTEGER NOT NULL,
+             source_label TEXT NOT NULL,
+             token_estimate INTEGER NOT NULL,
+             returned_at TEXT NOT NULL DEFAULT (datetime('now')),
+             access_count INTEGER NOT NULL DEFAULT 1
          );"
     )?;
     Ok(())

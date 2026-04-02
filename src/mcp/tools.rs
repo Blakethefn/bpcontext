@@ -59,7 +59,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "bpx_search",
-                "description": "Search indexed content using multi-layer search (BM25, trigram, fuzzy).",
+                "description": "Search indexed content using multi-layer search (BM25, trigram, fuzzy, semantic vector similarity).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

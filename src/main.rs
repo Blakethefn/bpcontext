@@ -1,6 +1,8 @@
 mod cli;
 mod config;
+mod context;
 mod db;
+mod embedder;
 mod executor;
 mod fetch;
 mod hooks;
@@ -20,6 +22,7 @@ use std::time::Duration;
 
 use cli::{Cli, Commands};
 use config::Config;
+use embedder::Embed;
 use store::ContentStore;
 
 fn project_dir() -> PathBuf {
@@ -172,6 +175,7 @@ fn main() -> Result<()> {
         }
 
         Some(Commands::Stats) => {
+            let config = Config::load()?;
             let store = ContentStore::open(&project_dir())?;
             let session_stats = stats::get_stats();
             let total_indexed = store.total_bytes_indexed()?;
@@ -194,6 +198,25 @@ fn main() -> Result<()> {
             println!("  Total indexed:      {} bytes", total_indexed);
             println!("  Sources:            {}", sources.len());
             println!("  DB size:            {} KB", db_size / 1024);
+
+            // Context budget summary
+            if let Ok(session_store) = session::SessionStore::open(&project_dir()) {
+                let conn = session_store.conn();
+                let ctx_tokens = context::ledger::total_tokens(conn).unwrap_or(0);
+                let ctx_sources = context::ledger::source_count(conn).unwrap_or(0);
+                let budget = config.context.budget_tokens;
+                let pct = if budget > 0 {
+                    ctx_tokens as f64 / budget as f64 * 100.0
+                } else {
+                    0.0
+                };
+
+                println!();
+                println!("{}", "Context Budget:".bold());
+                println!("  Tokens used:        {} / {} ({:.1}%)", ctx_tokens, budget, pct);
+                println!("  Sources tracked:    {}", ctx_sources);
+            }
+
             Ok(())
         }
 
@@ -214,6 +237,151 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+
+        Some(Commands::EmbedBackfill) => {
+            let config = Config::load()?;
+            if !config.embeddings.enabled {
+                println!("{}", "Embeddings disabled in config.".yellow());
+                return Ok(());
+            }
+
+            let model_dir = PathBuf::from(&config.embeddings.model_dir)
+                .join(&config.embeddings.model);
+            let emb = embedder::Embedder::new(&model_dir)?;
+
+            let store = ContentStore::open(&project_dir())?;
+            let conn = store.conn();
+
+            // Find chunks that don't have embeddings yet
+            let mut stmt = conn.prepare(
+                "SELECT c.rowid, c.title, c.content
+                 FROM chunks c
+                 LEFT JOIN chunk_embeddings ce ON c.rowid = ce.chunk_rowid
+                 WHERE ce.chunk_rowid IS NULL"
+            )?;
+
+            let missing: Vec<(i64, String, String)> = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if missing.is_empty() {
+                println!("{}", "All chunks already have embeddings.".green());
+                return Ok(());
+            }
+
+            println!("Found {} chunks without embeddings. Generating...", missing.len());
+
+            let batch_size = config.embeddings.batch_size;
+            let dim = emb.dim() as i32;
+            let mut total = 0usize;
+
+            for batch in missing.chunks(batch_size) {
+                let texts: Vec<String> = batch
+                    .iter()
+                    .map(|(_, title, content)| format!("{title} {content}"))
+                    .collect();
+                let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+                let embeddings = emb.embed_batch(&text_refs)?;
+
+                for ((rowid, _, _), embedding) in batch.iter().zip(embeddings.iter()) {
+                    let blob = embedder::embedding_to_bytes(embedding);
+                    conn.execute(
+                        "INSERT OR REPLACE INTO chunk_embeddings (chunk_rowid, embedding, dim) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![rowid, blob, dim],
+                    )?;
+                }
+
+                total += batch.len();
+                println!("  {} {} / {}", "->".green(), total, missing.len());
+            }
+
+            println!(
+                "{} Backfilled embeddings for {} chunks.",
+                "->".green(),
+                total
+            );
+            Ok(())
+        }
+
+        Some(Commands::ContextStatus) => {
+            let session_store = session::SessionStore::open(&project_dir())?;
+            let config = Config::load()?;
+            let conn = session_store.conn();
+
+            let total_tokens = context::ledger::total_tokens(conn)?;
+            let n_sources = context::ledger::source_count(conn)?;
+            let sources = context::ledger::source_breakdown(conn)?;
+
+            let pct = if config.context.budget_tokens > 0 {
+                total_tokens as f64 / config.context.budget_tokens as f64 * 100.0
+            } else {
+                0.0
+            };
+
+            println!("{}", "Context Budget".bold());
+            println!();
+            println!(
+                "  Tokens used: {} / {} ({:.1}%)",
+                total_tokens, config.context.budget_tokens, pct
+            );
+            println!("  Sources tracked: {}", n_sources);
+            println!();
+
+            if sources.is_empty() {
+                println!("{}", "  No sources tracked in this session.".dimmed());
+            } else {
+                println!("{}", "Per-Source Breakdown:".bold());
+                for source in &sources {
+                    println!(
+                        "  {} {} — {}t, {} accesses, last {}",
+                        "->".green(),
+                        source.label.bold(),
+                        source.tokens,
+                        source.access_count,
+                        source.last_access.dimmed()
+                    );
+                }
+            }
+
+            // Show relevance scores if there are enough sources
+            if sources.len() >= 2 {
+                let weights = context::advisor::RelevanceWeights {
+                    recency: config.context.recency_weight,
+                    frequency: config.context.frequency_weight,
+                    staleness: config.context.staleness_weight,
+                };
+                let scored = context::advisor::score_sources(
+                    conn,
+                    &weights,
+                    config.context.stale_threshold_minutes,
+                )?;
+
+                println!();
+                println!("{}", "Relevance Scores:".bold());
+                for s in &scored {
+                    let bar = if s.relevance > 0.6 {
+                        "high".green()
+                    } else if s.relevance > 0.3 {
+                        "mid".yellow()
+                    } else {
+                        "low".red()
+                    };
+                    println!(
+                        "  {} {} — {:.2} ({})",
+                        "->".green(),
+                        s.label.bold(),
+                        s.relevance,
+                        bar
+                    );
+                }
+            }
+
             Ok(())
         }
 

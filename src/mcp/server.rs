@@ -7,9 +7,13 @@ use std::time::Duration;
 use super::tools;
 use super::transport;
 use crate::config::Config;
+use crate::context::advisor::RelevanceWeights;
+use crate::context::ContextManager;
+use crate::embedder::Embedder;
 use crate::executor;
 use crate::fetch;
 use crate::promote;
+use crate::session::SessionStore;
 use crate::stats;
 use crate::store::ContentStore;
 use crate::truncate;
@@ -17,7 +21,36 @@ use crate::truncate;
 /// Run the MCP server loop over stdio
 pub fn run(project_dir: &Path) -> Result<()> {
     let config = Config::load()?;
-    let store = ContentStore::open(project_dir)?;
+    let mut store = ContentStore::open(project_dir)?;
+
+    // Lazy embedder initialization
+    if config.embeddings.enabled {
+        let model_dir = std::path::PathBuf::from(&config.embeddings.model_dir)
+            .join(&config.embeddings.model);
+        match Embedder::new(&model_dir) {
+            Ok(embedder) => {
+                store.set_embedder(std::sync::Arc::new(embedder));
+            }
+            Err(e) => {
+                eprintln!("[bpcontext] embedder unavailable, falling back to keyword search: {e}");
+            }
+        }
+    }
+
+    // Session store + context manager (reset per conversation)
+    let session_store = SessionStore::open(project_dir)?;
+    let weights = RelevanceWeights {
+        recency: config.context.recency_weight,
+        frequency: config.context.frequency_weight,
+        staleness: config.context.staleness_weight,
+    };
+    let mut ctx_mgr = ContextManager::new(
+        config.context.budget_tokens,
+        config.context.stale_threshold_minutes,
+        weights,
+    );
+    // Reset ledger at session start (per-conversation reset)
+    ctx_mgr.reset(session_store.conn())?;
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -60,19 +93,29 @@ pub fn run(project_dir: &Path) -> Result<()> {
             "tools/call" => {
                 let tool_name = request["params"]["name"].as_str().unwrap_or("");
                 let arguments = &request["params"]["arguments"];
-                let result = handle_tool_call(tool_name, arguments, &config, &store, project_dir);
+                let result = handle_tool_call(tool_name, arguments, &config, &store, project_dir, &session_store);
 
                 match result {
-                    Ok(content) => Some(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
-                            "content": [{
-                                "type": "text",
-                                "text": content
-                            }]
+                    Ok(mut content) => {
+                        // Record what was returned and check for context alerts
+                        let label = tool_label(tool_name, arguments);
+                        let _ = ctx_mgr.record(session_store.conn(), &label, content.len());
+                        if let Ok(Some(alert)) = ctx_mgr.check_alert(session_store.conn()) {
+                            content.push_str("\n\n---\n");
+                            content.push_str(&alert);
                         }
-                    })),
+
+                        Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": content
+                                }]
+                            }
+                        }))
+                    }
                     Err(e) => Some(json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -119,6 +162,7 @@ fn handle_tool_call(
     config: &Config,
     store: &ContentStore,
     project_dir: &Path,
+    session_store: &SessionStore,
 ) -> Result<String> {
     match tool_name {
         "bpx_execute" => handle_execute(args, config, store),
@@ -128,7 +172,7 @@ fn handle_tool_call(
         "bpx_fetch_and_index" => handle_fetch_and_index(args, config, store),
         "bpx_index" => handle_index(args, store),
         "bpx_promote" => handle_promote(args, config, store),
-        "bpx_stats" => handle_stats(store, project_dir),
+        "bpx_stats" => handle_stats(config, store, project_dir, session_store),
         _ => anyhow::bail!("Unknown tool: {tool_name}"),
     }
 }
@@ -171,6 +215,11 @@ fn handle_batch_execute(args: &Value, config: &Config, store: &ContentStore) -> 
     let commands = args["commands"].as_array().unwrap_or(&Vec::new()).clone();
     let queries = args["queries"].as_array().unwrap_or(&Vec::new()).clone();
 
+    let weights = crate::store::search::SearchWeights {
+        keyword_weight: config.search.keyword_weight,
+        vector_weight: config.search.vector_weight,
+    };
+
     let mut output = String::new();
     let mut section_labels = Vec::new();
 
@@ -209,7 +258,7 @@ fn handle_batch_execute(args: &Value, config: &Config, store: &ContentStore) -> 
         }
 
         stats::record_search();
-        let results = store.search(query, config.search.default_limit, None, None)?;
+        let results = store.search_with_weights(query, config.search.default_limit, None, None, &weights)?;
 
         output.push_str(&format!("### Query: \"{query}\"\n"));
         if results.is_empty() {
@@ -235,6 +284,11 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
     let content_type = args["content_type"].as_str();
     let limit = args["limit"].as_u64().unwrap_or(config.search.default_limit as u64) as u32;
 
+    let weights = crate::store::search::SearchWeights {
+        keyword_weight: config.search.keyword_weight,
+        vector_weight: config.search.vector_weight,
+    };
+
     let mut output = String::new();
 
     for query_val in &queries {
@@ -244,7 +298,7 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
         }
 
         stats::record_search();
-        let results = store.search(query, limit, source, content_type)?;
+        let results = store.search_with_weights(query, limit, source, content_type, &weights)?;
 
         output.push_str(&format!("### \"{query}\"\n"));
         if results.is_empty() {
@@ -354,7 +408,7 @@ fn handle_promote(args: &Value, config: &Config, store: &ContentStore) -> Result
     Ok(format!("Promoted to obsidian output note: {note_path}"))
 }
 
-fn handle_stats(store: &ContentStore, project_dir: &Path) -> Result<String> {
+fn handle_stats(config: &Config, store: &ContentStore, project_dir: &Path, session_store: &SessionStore) -> Result<String> {
     let session_stats = stats::get_stats();
     let total_indexed = store.total_bytes_indexed()?;
     let sources = store.list_sources()?;
@@ -364,7 +418,7 @@ fn handle_stats(store: &ContentStore, project_dir: &Path) -> Result<String> {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    Ok(format!(
+    let mut output = format!(
         "## bpcontext Stats\n\n\
          **Session:**\n\
          - Commands executed: {}\n\
@@ -385,5 +439,68 @@ fn handle_stats(store: &ContentStore, project_dir: &Path) -> Result<String> {
         session_stats.tokens_saved(),
         sources.len(),
         db_size / 1024,
-    ))
+    );
+
+    // Context budget summary
+    let conn = session_store.conn();
+    let ctx_tokens = crate::context::ledger::total_tokens(conn).unwrap_or(0);
+    let ctx_sources = crate::context::ledger::source_count(conn).unwrap_or(0);
+    let budget = config.context.budget_tokens;
+    let pct = if budget > 0 {
+        ctx_tokens as f64 / budget as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    output.push_str(&format!(
+        "\n**Context Budget:**\n\
+         - Tokens used: {ctx_tokens}/{budget} ({pct:.1}%)\n\
+         - Sources tracked: {ctx_sources}\n"
+    ));
+
+    // Per-source breakdown if any sources are tracked
+    let breakdown = crate::context::ledger::source_breakdown(conn).unwrap_or_default();
+    if !breakdown.is_empty() {
+        output.push_str("- Top consumers: ");
+        let top: Vec<String> = breakdown
+            .iter()
+            .take(5)
+            .map(|s| format!("{} ({}t)", s.label, s.tokens))
+            .collect();
+        output.push_str(&top.join(", "));
+        output.push('\n');
+    }
+
+    Ok(output)
+}
+
+/// Extract a human-readable label from a tool call for the context ledger.
+fn tool_label(tool_name: &str, args: &Value) -> String {
+    match tool_name {
+        "bpx_execute" => args["label"]
+            .as_str()
+            .or_else(|| args["command"].as_str())
+            .unwrap_or("execute")
+            .to_string(),
+        "bpx_execute_file" => args["path"]
+            .as_str()
+            .and_then(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+            })
+            .unwrap_or("file")
+            .to_string(),
+        "bpx_search" => "search".to_string(),
+        "bpx_batch_execute" => "batch".to_string(),
+        "bpx_fetch_and_index" => args["label"]
+            .as_str()
+            .or_else(|| args["url"].as_str())
+            .unwrap_or("fetch")
+            .to_string(),
+        "bpx_index" => args["label"].as_str().unwrap_or("index").to_string(),
+        "bpx_promote" => "promote".to_string(),
+        "bpx_stats" => "stats".to_string(),
+        _ => tool_name.to_string(),
+    }
 }
