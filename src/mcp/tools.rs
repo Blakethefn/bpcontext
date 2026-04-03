@@ -230,6 +230,24 @@ pub fn tool_definitions() -> Value {
                     "properties": {},
                     "required": []
                 }
+            },
+            {
+                "name": "bpx_sources",
+                "description": "List all indexed sources with chunk counts and timestamps. Use this to discover labels for bpx_read_chunks or bpx_search --source.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "bpx_context_status",
+                "description": "Show context budget usage, per-source token breakdown, and relevance scores.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
             }
         ]
     })

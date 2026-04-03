@@ -183,6 +183,8 @@ fn handle_tool_call(
         "bpx_promote" => handle_promote(args, config, store),
         "bpx_index_dir" => handle_index_dir(args, config, store),
         "bpx_stats" => handle_stats(config, store, project_dir, session_store),
+        "bpx_sources" => handle_sources(store),
+        "bpx_context_status" => handle_context_status(config, session_store),
         _ => anyhow::bail!("Unknown tool: {tool_name}"),
     }
 }
@@ -711,6 +713,86 @@ fn handle_stats(
     Ok(output)
 }
 
+fn handle_sources(store: &ContentStore) -> Result<String> {
+    let sources = store.list_sources()?;
+
+    if sources.is_empty() {
+        return Ok("No sources indexed.".to_string());
+    }
+
+    let mut output = format!("## Indexed Sources ({})\n\n", sources.len());
+    for source in &sources {
+        output.push_str(&format!(
+            "- **{}** — {} chunks, indexed {}\n",
+            source.label, source.chunk_count, source.indexed_at
+        ));
+    }
+    Ok(output)
+}
+
+fn handle_context_status(config: &Config, session_store: &SessionStore) -> Result<String> {
+    let conn = session_store.conn();
+
+    let total_tokens = crate::context::ledger::total_tokens(conn)?;
+    let n_sources = crate::context::ledger::source_count(conn)?;
+    let breakdown = crate::context::ledger::source_breakdown(conn)?;
+    let budget = config.context.budget_tokens;
+    let pct = if budget > 0 {
+        total_tokens as f64 / budget as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let mut output = format!(
+        "## Context Budget\n\n\
+         - Tokens used: {total_tokens}/{budget} ({pct:.1}%)\n\
+         - Sources tracked: {n_sources}\n"
+    );
+
+    if !breakdown.is_empty() {
+        output.push_str("\n### Per-Source Breakdown\n\n");
+        for source in &breakdown {
+            output.push_str(&format!(
+                "- **{}** — {}t, {} accesses, last {}\n",
+                source.label, source.tokens, source.access_count, source.last_access
+            ));
+        }
+    }
+
+    // Relevance scores if enough sources
+    if breakdown.len() >= 2 {
+        let weights = crate::context::advisor::RelevanceWeights {
+            recency: config.context.recency_weight,
+            frequency: config.context.frequency_weight,
+            staleness: config.context.staleness_weight,
+        };
+        let scored = crate::context::advisor::score_sources(
+            conn,
+            &weights,
+            config.context.stale_threshold_minutes,
+        )?;
+
+        if !scored.is_empty() {
+            output.push_str("\n### Relevance Scores\n\n");
+            for s in &scored {
+                let level = if s.relevance > 0.6 {
+                    "high"
+                } else if s.relevance > 0.3 {
+                    "mid"
+                } else {
+                    "low"
+                };
+                output.push_str(&format!(
+                    "- **{}** — {:.2} ({})\n",
+                    s.label, s.relevance, level
+                ));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 /// Extract a human-readable label from a tool call for the context ledger.
 fn tool_label(tool_name: &str, args: &Value) -> String {
     match tool_name {
@@ -736,6 +818,8 @@ fn tool_label(tool_name: &str, args: &Value) -> String {
         "bpx_promote" => "promote".to_string(),
         "bpx_index_dir" => args["path"].as_str().unwrap_or("index-dir").to_string(),
         "bpx_stats" => "stats".to_string(),
+        "bpx_sources" => "sources".to_string(),
+        "bpx_context_status" => "context-status".to_string(),
         _ => tool_name.to_string(),
     }
 }
@@ -1163,5 +1247,39 @@ mod tests {
 
         assert!(result.contains("Bytes visible to agent: 120"));
         assert!(result.contains("Visibility ratio"));
+    }
+
+    #[test]
+    fn test_sources_lists_indexed() {
+        let (_dir, store) = make_store();
+        store.index("alpha/main.rs", "fn main() {}", None).unwrap();
+        store.index("alpha/lib.rs", "pub mod utils;", None).unwrap();
+
+        let result = handle_sources(&store).unwrap();
+
+        assert!(result.contains("Indexed Sources (2)"));
+        assert!(result.contains("alpha/main.rs"));
+        assert!(result.contains("alpha/lib.rs"));
+    }
+
+    #[test]
+    fn test_sources_empty() {
+        let (_dir, store) = make_store();
+
+        let result = handle_sources(&store).unwrap();
+
+        assert!(result.contains("No sources indexed"));
+    }
+
+    #[test]
+    fn test_context_status_shows_budget() {
+        let (_dir, _store, session_store) = make_store_with_session();
+        let config = test_config();
+
+        let result = handle_context_status(&config, &session_store).unwrap();
+
+        assert!(result.contains("Context Budget"));
+        assert!(result.contains("Tokens used:"));
+        assert!(result.contains("Sources tracked:"));
     }
 }
