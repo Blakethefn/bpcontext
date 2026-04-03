@@ -33,8 +33,8 @@ impl CandleEmbedder {
         let config_path = model_dir.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
-        let config: BertConfig = serde_json::from_str(&config_str)
-            .context("failed to parse model config.json")?;
+        let config: BertConfig =
+            serde_json::from_str(&config_str).context("failed to parse model config.json")?;
 
         let weights_path = model_dir.join("model.safetensors");
         let vb = unsafe {
@@ -42,8 +42,8 @@ impl CandleEmbedder {
                 .context("failed to load model.safetensors")?
         };
 
-        let model = BertModel::load(vb, &config)
-            .context("failed to build BertModel from weights")?;
+        let model =
+            BertModel::load(vb, &config).context("failed to build BertModel from weights")?;
 
         let tokenizer_path = model_dir.join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -101,7 +101,11 @@ impl CandleEmbedder {
             .collect::<Result<Vec<_>>>()?;
 
         // Pad to longest sequence in batch
-        let max_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap_or(0);
+        let max_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0);
 
         let mut input_ids_vec = Vec::with_capacity(texts.len() * max_len);
         let mut attention_mask_vec = Vec::with_capacity(texts.len() * max_len);

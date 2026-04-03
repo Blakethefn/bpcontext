@@ -38,15 +38,15 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Serve) => {
-            mcp::server::run(&project_dir())
-        }
+        Some(Commands::Serve) => mcp::server::run(&project_dir()),
 
-        Some(Commands::Hook { hook_type }) => {
-            hooks::dispatch(&hook_type)
-        }
+        Some(Commands::Hook { hook_type }) => hooks::dispatch(&hook_type),
 
-        Some(Commands::Execute { command, label, timeout_ms }) => {
+        Some(Commands::Execute {
+            command,
+            label,
+            timeout_ms,
+        }) => {
             let config = Config::load()?;
             let store = ContentStore::open(&project_dir())?;
             let label = label.as_deref().unwrap_or(&command);
@@ -80,17 +80,18 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Some(Commands::Search { query, source, content_type, limit }) => {
+        Some(Commands::Search {
+            query,
+            source,
+            content_type,
+            limit,
+        }) => {
             let _config = Config::load()?;
             let store = ContentStore::open(&project_dir())?;
 
             stats::record_search();
-            let results = store.search(
-                &query,
-                limit,
-                source.as_deref(),
-                content_type.as_deref(),
-            )?;
+            let results =
+                store.search(&query, limit, source.as_deref(), content_type.as_deref())?;
 
             if results.is_empty() {
                 println!("{}", "No results found.".yellow());
@@ -112,7 +113,11 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Some(Commands::Index { label, content, content_type }) => {
+        Some(Commands::Index {
+            label,
+            content,
+            content_type,
+        }) => {
             let store = ContentStore::open(&project_dir())?;
 
             let text = match content {
@@ -155,7 +160,11 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Some(Commands::Promote { query, name, project }) => {
+        Some(Commands::Promote {
+            query,
+            name,
+            project,
+        }) => {
             let config = Config::load()?;
             let store = ContentStore::open(&project_dir())?;
 
@@ -192,7 +201,15 @@ fn main() -> Result<()> {
             println!("  Searches performed: {}", session_stats.searches_performed);
             println!("  Bytes indexed:      {}", session_stats.bytes_indexed);
             println!("  Bytes returned:     {}", session_stats.bytes_returned);
-            println!("  Savings ratio:      {:.1}x", session_stats.savings_ratio());
+            println!("  Bytes visible:      {}", session_stats.bytes_visible);
+            println!(
+                "  Visibility ratio:   {:.1}%",
+                session_stats.visibility_ratio() * 100.0
+            );
+            println!(
+                "  Savings ratio:      {:.1}x",
+                session_stats.savings_ratio()
+            );
             println!("  Est. tokens saved:  {}", session_stats.tokens_saved());
             println!();
             println!("{}", "Content Store:".bold());
@@ -214,7 +231,10 @@ fn main() -> Result<()> {
 
                 println!();
                 println!("{}", "Context Budget:".bold());
-                println!("  Tokens used:        {} / {} ({:.1}%)", ctx_tokens, budget, pct);
+                println!(
+                    "  Tokens used:        {} / {} ({:.1}%)",
+                    ctx_tokens, budget, pct
+                );
                 println!("  Sources tracked:    {}", ctx_sources);
             }
 
@@ -248,8 +268,8 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let model_dir = PathBuf::from(&config.embeddings.model_dir)
-                .join(&config.embeddings.model);
+            let model_dir =
+                PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
             let emb = embedder::Embedder::new(&model_dir)?;
 
             let store = ContentStore::open(&project_dir())?;
@@ -260,13 +280,11 @@ fn main() -> Result<()> {
                 "SELECT c.rowid, c.title, c.content
                  FROM chunks c
                  LEFT JOIN chunk_embeddings ce ON c.rowid = ce.chunk_rowid
-                 WHERE ce.chunk_rowid IS NULL"
+                 WHERE ce.chunk_rowid IS NULL",
             )?;
 
             let missing: Vec<(i64, String, String)> = stmt
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
 
@@ -275,7 +293,10 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            println!("Found {} chunks without embeddings. Generating...", missing.len());
+            println!(
+                "Found {} chunks without embeddings. Generating...",
+                missing.len()
+            );
 
             let batch_size = config.embeddings.batch_size;
             let dim = emb.dim() as i32;
@@ -386,14 +407,13 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Some(Commands::IndexDir { path, glob, label_prefix }) => {
+        Some(Commands::IndexDir {
+            path,
+            glob,
+            label_prefix,
+        }) => {
             let store = ContentStore::open(&project_dir())?;
-            let result = indexdir::index_directory(
-                &store,
-                &path,
-                glob.as_deref(),
-                &label_prefix,
-            )?;
+            let result = indexdir::index_directory(&store, &path, glob.as_deref(), &label_prefix)?;
             stats::record_indexed(result.total_bytes);
             println!(
                 "{} Indexed {} files ({} chunks, {} skipped)",
@@ -410,7 +430,10 @@ fn main() -> Result<()> {
 
         None => {
             // Default: show stats
-            println!("{}", "bpcontext - Context window optimization for Claude Code".bold());
+            println!(
+                "{}",
+                "bpcontext - Context window optimization for Claude Code".bold()
+            );
             println!("Run 'bpcontext --help' for usage.");
             Ok(())
         }

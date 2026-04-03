@@ -35,17 +35,19 @@ impl Embedder {
     /// If the model files are not present, downloads them via hf-hub first.
     pub fn new(model_dir: &Path) -> Result<Self> {
         let model_dir = ensure_model_downloaded(model_dir)?;
-        let inner = CandleEmbedder::load(&model_dir)
-            .context("failed to load embedding model")?;
+        let inner = CandleEmbedder::load(&model_dir).context("failed to load embedding model")?;
         Ok(Self { inner })
     }
 
     /// Default model directory: `~/.local/share/bpcontext/models/all-MiniLM-L6-v2`
     #[allow(dead_code)]
     pub fn default_model_dir() -> Result<PathBuf> {
-        let data_dir = dirs::data_local_dir()
-            .context("could not determine local data directory")?;
-        Ok(data_dir.join("bpcontext").join("models").join("all-MiniLM-L6-v2"))
+        let data_dir =
+            dirs::data_local_dir().context("could not determine local data directory")?;
+        Ok(data_dir
+            .join("bpcontext")
+            .join("models")
+            .join("all-MiniLM-L6-v2"))
     }
 }
 
@@ -77,8 +79,7 @@ fn ensure_model_downloaded(model_dir: &Path) -> Result<PathBuf> {
 
     eprintln!("[bpcontext] Downloading all-MiniLM-L6-v2 model (~80MB, one-time)...");
 
-    let api = hf_hub::api::sync::Api::new()
-        .context("failed to initialize hf-hub API")?;
+    let api = hf_hub::api::sync::Api::new().context("failed to initialize hf-hub API")?;
     let repo = api.model("sentence-transformers/all-MiniLM-L6-v2".to_string());
 
     // Download each required file

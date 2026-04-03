@@ -194,10 +194,30 @@ mod tests {
     #[test]
     fn keep_drop_lists_correct() {
         let scored = vec![
-            ScoredSource { label: "a".into(), tokens: 100, access_count: 5, relevance: 0.9 },
-            ScoredSource { label: "b".into(), tokens: 200, access_count: 3, relevance: 0.7 },
-            ScoredSource { label: "c".into(), tokens: 300, access_count: 1, relevance: 0.3 },
-            ScoredSource { label: "d".into(), tokens: 150, access_count: 1, relevance: 0.1 },
+            ScoredSource {
+                label: "a".into(),
+                tokens: 100,
+                access_count: 5,
+                relevance: 0.9,
+            },
+            ScoredSource {
+                label: "b".into(),
+                tokens: 200,
+                access_count: 3,
+                relevance: 0.7,
+            },
+            ScoredSource {
+                label: "c".into(),
+                tokens: 300,
+                access_count: 1,
+                relevance: 0.3,
+            },
+            ScoredSource {
+                label: "d".into(),
+                tokens: 150,
+                access_count: 1,
+                relevance: 0.1,
+            },
         ];
 
         let (keep, drop) = keep_drop_lists(&scored, 2, 2);
@@ -211,16 +231,36 @@ mod tests {
 
     #[test]
     fn estimate_savings_sums_tokens() {
-        let a = ScoredSource { label: "x".into(), tokens: 100, access_count: 1, relevance: 0.1 };
-        let b = ScoredSource { label: "y".into(), tokens: 200, access_count: 1, relevance: 0.2 };
+        let a = ScoredSource {
+            label: "x".into(),
+            tokens: 100,
+            access_count: 1,
+            relevance: 0.1,
+        };
+        let b = ScoredSource {
+            label: "y".into(),
+            tokens: 200,
+            access_count: 1,
+            relevance: 0.2,
+        };
         assert_eq!(estimate_savings(&[&a, &b]), 300);
     }
 
     #[test]
     fn keep_drop_no_overlap_when_few_sources() {
         let scored = vec![
-            ScoredSource { label: "a".into(), tokens: 100, access_count: 3, relevance: 0.9 },
-            ScoredSource { label: "b".into(), tokens: 200, access_count: 1, relevance: 0.3 },
+            ScoredSource {
+                label: "a".into(),
+                tokens: 100,
+                access_count: 3,
+                relevance: 0.9,
+            },
+            ScoredSource {
+                label: "b".into(),
+                tokens: 200,
+                access_count: 1,
+                relevance: 0.3,
+            },
         ];
 
         let (keep, drop) = keep_drop_lists(&scored, 3, 3);

@@ -5,8 +5,8 @@ use super::write_hook_output;
 use crate::config::Config;
 use crate::context::advisor::RelevanceWeights;
 use crate::context::ContextManager;
-use crate::session::SessionStore;
 use crate::session::snapshot;
+use crate::session::SessionStore;
 
 /// Handle PreCompact hook
 ///

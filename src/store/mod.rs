@@ -34,10 +34,7 @@ impl ContentStore {
 
     /// Open with an embedder for semantic search support
     #[allow(dead_code)]
-    pub fn open_with_embedder(
-        project_dir: &Path,
-        embedder: Arc<dyn Embed>,
-    ) -> Result<Self> {
+    pub fn open_with_embedder(project_dir: &Path, embedder: Arc<dyn Embed>) -> Result<Self> {
         let db_path = db::content_db_path(project_dir)?;
         let conn = db::open_db(&db_path)?;
         schema::init_content_schema(&conn)?;
@@ -77,7 +74,12 @@ impl ContentStore {
 
     /// Index content with a label, splitting into chunks.
     /// Generates embeddings for each chunk if an embedder is available.
-    pub fn index(&self, label: &str, content: &str, content_type: Option<&str>) -> Result<IndexResult> {
+    pub fn index(
+        &self,
+        label: &str,
+        content: &str,
+        content_type: Option<&str>,
+    ) -> Result<IndexResult> {
         let chunks = chunker::chunk_content(content);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -93,9 +95,7 @@ impl ContentStore {
         let mut embed_texts: Vec<String> = Vec::with_capacity(chunks.len());
 
         for chunk in &chunks {
-            let ct = content_type.unwrap_or(
-                if chunk.is_code { "code" } else { "prose" }
-            );
+            let ct = content_type.unwrap_or(if chunk.is_code { "code" } else { "prose" });
 
             // Insert into primary FTS5 table
             self.conn.execute(
@@ -161,7 +161,13 @@ impl ContentStore {
         source_filter: Option<&str>,
         type_filter: Option<&str>,
     ) -> Result<Vec<search::SearchResult>> {
-        self.search_with_weights(query, limit, source_filter, type_filter, &search::SearchWeights::default())
+        self.search_with_weights(
+            query,
+            limit,
+            source_filter,
+            type_filter,
+            &search::SearchWeights::default(),
+        )
     }
 
     /// Search with explicit weight configuration for keyword vs vector layers.
@@ -174,7 +180,15 @@ impl ContentStore {
         weights: &search::SearchWeights,
     ) -> Result<Vec<search::SearchResult>> {
         let embedder_ref = self.embedder.as_deref();
-        search::multi_layer_search(&self.conn, query, limit, source_filter, type_filter, embedder_ref, weights)
+        search::multi_layer_search(
+            &self.conn,
+            query,
+            limit,
+            source_filter,
+            type_filter,
+            embedder_ref,
+            weights,
+        )
     }
 
     /// List all indexed sources
@@ -182,17 +196,44 @@ impl ContentStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, label, indexed_at, chunk_count, code_chunk_count FROM sources ORDER BY indexed_at DESC"
         )?;
-        let sources = stmt.query_map([], |row| {
-            Ok(SourceInfo {
-                id: row.get(0)?,
-                label: row.get(1)?,
-                indexed_at: row.get(2)?,
-                chunk_count: row.get(3)?,
-                code_chunk_count: row.get(4)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()
+        let sources = stmt
+            .query_map([], |row| {
+                Ok(SourceInfo {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    indexed_at: row.get(2)?,
+                    chunk_count: row.get(3)?,
+                    code_chunk_count: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
             .context("Failed to list sources")?;
         Ok(sources)
+    }
+
+    /// Retrieve indexed chunks for a single source label in original order.
+    pub fn get_chunks_by_source(&self, label: &str) -> Result<Vec<ChunkInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.rowid, c.title, c.content, c.content_type
+             FROM chunks c
+             JOIN sources s ON c.source_id = s.id
+             WHERE s.label = ?1
+             ORDER BY c.rowid",
+        )?;
+
+        let chunks = stmt
+            .query_map(rusqlite::params![label], |row| {
+                Ok(ChunkInfo {
+                    rowid: row.get(0)?,
+                    title: row.get(1)?,
+                    content: row.get(2)?,
+                    content_type: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to load chunks by source")?;
+
+        Ok(chunks)
     }
 
     /// Get total bytes indexed (approximate from chunk content)
@@ -230,6 +271,15 @@ pub struct SourceInfo {
     pub code_chunk_count: u32,
 }
 
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ChunkInfo {
+    pub rowid: i64,
+    pub title: String,
+    pub content: String,
+    pub content_type: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,7 +311,9 @@ mod tests {
     #[test]
     fn index_without_embedder_stores_no_embeddings() {
         let store = test_store();
-        let result = store.index("test", "Hello world, this is a test.", None).unwrap();
+        let result = store
+            .index("test", "Hello world, this is a test.", None)
+            .unwrap();
         assert!(result.chunk_count > 0);
 
         let count: i64 = store
@@ -275,7 +327,11 @@ mod tests {
     fn index_with_embedder_stores_embeddings() {
         let store = test_store_with_embedder();
         let result = store
-            .index("test", "Hello world, this is a test of embedding storage.", None)
+            .index(
+                "test",
+                "Hello world, this is a test of embedding storage.",
+                None,
+            )
             .unwrap();
         assert!(result.chunk_count > 0);
 
@@ -295,11 +351,9 @@ mod tests {
 
         let blob: Vec<u8> = store
             .conn
-            .query_row(
-                "SELECT embedding FROM chunk_embeddings LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT embedding FROM chunk_embeddings LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         let embedding = bytes_to_embedding(&blob);
@@ -315,19 +369,14 @@ mod tests {
 
         let blob: Vec<u8> = store
             .conn
-            .query_row(
-                "SELECT embedding FROM chunk_embeddings LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT embedding FROM chunk_embeddings LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         let embedding = bytes_to_embedding(&blob);
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-4,
-            "expected unit norm, got {norm}"
-        );
+        assert!((norm - 1.0).abs() < 1e-4, "expected unit norm, got {norm}");
     }
 
     #[test]
@@ -355,7 +404,11 @@ mod tests {
 
         // Index enough content to produce multiple chunks
         let content = (0..20)
-            .map(|i| format!("## Section {i}\n\nThis is section {i} with enough content to form a chunk.\n"))
+            .map(|i| {
+                format!(
+                    "## Section {i}\n\nThis is section {i} with enough content to form a chunk.\n"
+                )
+            })
             .collect::<String>();
 
         let result = store.index("multi-chunk", &content, None).unwrap();
@@ -363,10 +416,7 @@ mod tests {
 
         // Every chunk should have a corresponding embedding
         let chunk_rowids: Vec<i64> = {
-            let mut stmt = store
-                .conn
-                .prepare("SELECT rowid FROM chunks")
-                .unwrap();
+            let mut stmt = store.conn.prepare("SELECT rowid FROM chunks").unwrap();
             stmt.query_map([], |r| r.get(0))
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -387,5 +437,47 @@ mod tests {
         let mut sorted_chunks = chunk_rowids.clone();
         sorted_chunks.sort();
         assert_eq!(sorted_chunks, emb_rowids);
+    }
+
+    fn multi_chunk_source() -> String {
+        format!(
+            "# Alpha\n\n{}\n\n# Beta\n\n{}\n",
+            "alpha line\n".repeat(350),
+            "beta line\n".repeat(350),
+        )
+    }
+
+    #[test]
+    fn test_get_chunks_by_source_returns_all() {
+        let store = test_store();
+        let content = multi_chunk_source();
+        let indexed = store.index("guide.md", &content, None).unwrap();
+
+        let chunks = store.get_chunks_by_source("guide.md").unwrap();
+        assert_eq!(chunks.len(), indexed.chunk_count as usize);
+        assert!(chunks.iter().all(|chunk| !chunk.content.is_empty()));
+    }
+
+    #[test]
+    fn test_get_chunks_by_source_unknown_label_empty() {
+        let store = test_store();
+        store.index("known", "hello world", None).unwrap();
+
+        let chunks = store.get_chunks_by_source("missing").unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_get_chunks_by_source_preserves_order() {
+        let store = test_store();
+        store
+            .index("ordered.md", &multi_chunk_source(), None)
+            .unwrap();
+
+        let chunks = store.get_chunks_by_source("ordered.md").unwrap();
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+        assert!(chunks[0].rowid < chunks[1].rowid);
+        assert!(chunks[0].content.contains("alpha line"));
+        assert!(chunks[1].content.contains("beta line"));
     }
 }

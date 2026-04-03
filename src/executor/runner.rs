@@ -62,7 +62,10 @@ pub fn execute_command(
     // Split back into stdout/stderr for the result
     let (stdout, stderr) = if final_output.contains("\n--- stderr ---\n") {
         let parts: Vec<&str> = final_output.splitn(2, "\n--- stderr ---\n").collect();
-        (parts[0].to_string(), parts.get(1).unwrap_or(&"").to_string())
+        (
+            parts[0].to_string(),
+            parts.get(1).unwrap_or(&"").to_string(),
+        )
     } else {
         (final_output, String::new())
     };
@@ -97,12 +100,7 @@ mod tests {
     #[test]
     fn test_execute_truncation() {
         // Generate large output
-        let result = execute_command(
-            "seq 1 100000",
-            1024,
-            0.6,
-            None,
-        ).unwrap();
+        let result = execute_command("seq 1 100000", 1024, 0.6, None).unwrap();
         assert!(result.truncated);
     }
 }

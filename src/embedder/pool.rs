@@ -47,11 +47,7 @@ mod tests {
     fn mean_pool_simple() {
         let device = Device::Cpu;
         // (1, 3, 2) — 1 batch, 3 tokens, 2 dims
-        let embeddings = Tensor::new(
-            &[[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]],
-            &device,
-        )
-        .unwrap();
+        let embeddings = Tensor::new(&[[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]], &device).unwrap();
         // All tokens valid
         let mask = Tensor::new(&[[1.0f32, 1.0, 1.0]], &device).unwrap();
 
@@ -66,11 +62,8 @@ mod tests {
     fn mean_pool_with_padding() {
         let device = Device::Cpu;
         // (1, 3, 2) — last token is padding
-        let embeddings = Tensor::new(
-            &[[[1.0f32, 2.0], [3.0, 4.0], [999.0, 999.0]]],
-            &device,
-        )
-        .unwrap();
+        let embeddings =
+            Tensor::new(&[[[1.0f32, 2.0], [3.0, 4.0], [999.0, 999.0]]], &device).unwrap();
         let mask = Tensor::new(&[[1.0f32, 1.0, 0.0]], &device).unwrap();
 
         let result = mean_pool(&embeddings, &mask).unwrap();

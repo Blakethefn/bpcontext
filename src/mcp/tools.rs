@@ -79,7 +79,11 @@ pub fn tool_definitions() -> Value {
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max results per query (default: 10)"
+                            "description": "Max results per query (default: 15)"
+                        },
+                        "snippet_bytes": {
+                            "type": "integer",
+                            "description": "Max bytes per snippet for top results (default: 2000)"
                         }
                     },
                     "required": ["queries"]
@@ -102,9 +106,35 @@ pub fn tool_definitions() -> Value {
                         "code": {
                             "type": "string",
                             "description": "Optional processing script to pipe the file through"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query. For large files, returns relevant chunks instead of head-only preview."
                         }
                     },
                     "required": ["path"]
+                }
+            },
+            {
+                "name": "bpx_read_chunks",
+                "description": "Retrieve full indexed content by source label. Returns chunks in original order and does not truncate them.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": "Exact source label to read back from the index"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Optional query to filter to only matching chunks within that source"
+                        },
+                        "max_chunks": {
+                            "type": "integer",
+                            "description": "Maximum chunks to return (default: 10)"
+                        }
+                    },
+                    "required": ["label"]
                 }
             },
             {
@@ -168,6 +198,28 @@ pub fn tool_definitions() -> Value {
                         }
                     },
                     "required": ["query", "name", "project"]
+                }
+            },
+            {
+                "name": "bpx_index_dir",
+                "description": "Index all source files in a directory. Walks the directory respecting .gitignore, skips binary files, and indexes everything into the content store for later bpx_search. Run this at the start of exploration tasks to seed the search index.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory path to index (e.g. \"./src\", \"/absolute/path/to/project\")"
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Glob pattern to filter files (e.g. \"*.rs\", \"*.py\"). Matches at any depth. If omitted, all non-binary text files are indexed."
+                        },
+                        "label_prefix": {
+                            "type": "string",
+                            "description": "Prefix for all labels (e.g. \"myproject/\"). Defaults to empty string."
+                        }
+                    },
+                    "required": ["path"]
                 }
             },
             {

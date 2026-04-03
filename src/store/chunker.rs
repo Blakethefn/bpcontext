@@ -478,24 +478,27 @@ fn detect_code(content: &str) -> bool {
     }
 
     // >60% of lines start with common code patterns
-    let code_lines = lines.iter().filter(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("fn ")
-            || trimmed.starts_with("pub ")
-            || trimmed.starts_with("let ")
-            || trimmed.starts_with("const ")
-            || trimmed.starts_with("import ")
-            || trimmed.starts_with("from ")
-            || trimmed.starts_with("def ")
-            || trimmed.starts_with("class ")
-            || trimmed.starts_with("//")
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with('#')
-            || trimmed.starts_with('{')
-            || trimmed.starts_with('}')
-            || trimmed.ends_with(';')
-            || trimmed.ends_with('{')
-    }).count();
+    let code_lines = lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub ")
+                || trimmed.starts_with("let ")
+                || trimmed.starts_with("const ")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("def ")
+                || trimmed.starts_with("class ")
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('{')
+                || trimmed.starts_with('}')
+                || trimmed.ends_with(';')
+                || trimmed.ends_with('{')
+        })
+        .count();
 
     code_lines as f64 / lines.len() as f64 > 0.6
 }
@@ -523,7 +526,9 @@ mod tests {
     #[test]
     fn test_detect_code() {
         assert!(detect_code("fn main() {\n    println!(\"hello\");\n}"));
-        assert!(!detect_code("This is just a regular sentence about things."));
+        assert!(!detect_code(
+            "This is just a regular sentence about things."
+        ));
     }
 
     #[test]
@@ -588,7 +593,11 @@ mod tests {
         let chunks = chunk_content(&content);
 
         // Should produce multiple chunks, not 1-3
-        assert!(chunks.len() >= 5, "Expected >=5 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 5,
+            "Expected >=5 chunks, got {}",
+            chunks.len()
+        );
 
         // Every chunk must respect MAX_CHUNK_BYTES
         for chunk in &chunks {

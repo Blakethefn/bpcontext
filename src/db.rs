@@ -47,7 +47,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;"
+         PRAGMA busy_timeout = 5000;",
     )?;
     Ok(conn)
 }
@@ -74,8 +74,7 @@ pub fn list_content_dbs() -> Result<Vec<(PathBuf, std::time::SystemTime)>> {
 /// Delete content DBs older than the given number of days
 #[allow(dead_code)]
 pub fn cleanup_stale_dbs(stale_days: u64) -> Result<u32> {
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(stale_days * 86400);
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(stale_days * 86400);
     let dbs = list_content_dbs()?;
     let mut deleted = 0u32;
     for (path, modified) in dbs {

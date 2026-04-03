@@ -4,6 +4,7 @@ pub mod ledger;
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::stats;
 use advisor::{RelevanceWeights, ScoredSource};
 
 /// Utilization thresholds that trigger inline alerts.
@@ -21,6 +22,8 @@ pub struct ContextManager {
     weights: RelevanceWeights,
     /// Which thresholds have already fired this session
     fired: [bool; 5],
+    /// Whether the low-visibility warning has already fired this session
+    visibility_alert_fired: bool,
 }
 
 impl ContextManager {
@@ -30,6 +33,7 @@ impl ContextManager {
             stale_minutes,
             weights,
             fired: [false; 5],
+            visibility_alert_fired: false,
         }
     }
 
@@ -50,6 +54,8 @@ impl ContextManager {
             0
         };
 
+        let session_stats = stats::get_stats();
+
         // Find the highest threshold that was crossed but not yet fired
         let mut alert_idx = None;
         for (i, &threshold) in THRESHOLDS.iter().enumerate() {
@@ -60,7 +66,19 @@ impl ContextManager {
 
         let idx = match alert_idx {
             Some(i) => i,
-            None => return Ok(None),
+            None => {
+                if !self.visibility_alert_fired
+                    && session_stats.bytes_indexed > 10_000
+                    && session_stats.visibility_ratio() < 0.05
+                {
+                    self.visibility_alert_fired = true;
+                    return Ok(Some(format!(
+                        "[bpx visibility: only {:.1}% of indexed content seen. Use bpx_search or bpx_read_chunks.]",
+                        session_stats.visibility_ratio() * 100.0
+                    )));
+                }
+                return Ok(None);
+            }
         };
 
         // Mark this and all lower thresholds as fired
@@ -190,6 +208,7 @@ impl ContextManager {
     pub fn reset(&mut self, conn: &Connection) -> Result<()> {
         ledger::clear(conn)?;
         self.fired = [false; 5];
+        self.visibility_alert_fired = false;
         Ok(())
     }
 }
@@ -205,6 +224,7 @@ fn format_scored_list(sources: &[&ScoredSource]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stats;
     use crate::store::schema;
 
     fn test_conn() -> Connection {
@@ -219,6 +239,7 @@ mod tests {
 
     #[test]
     fn no_alert_below_40_pct() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -231,6 +252,7 @@ mod tests {
 
     #[test]
     fn alert_at_40_pct() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -245,6 +267,7 @@ mod tests {
 
     #[test]
     fn threshold_fires_only_once() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -259,6 +282,7 @@ mod tests {
 
     #[test]
     fn skipped_thresholds_fire_highest() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -275,6 +299,7 @@ mod tests {
 
     #[test]
     fn alert_60_shows_top_consumers() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -290,6 +315,7 @@ mod tests {
 
     #[test]
     fn alert_90_shows_remaining() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -305,6 +331,7 @@ mod tests {
 
     #[test]
     fn reset_clears_ledger_and_fired() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -323,6 +350,7 @@ mod tests {
 
     #[test]
     fn precompact_recommendation_has_sections() {
+        stats::reset();
         let conn = test_conn();
         let mgr = test_mgr(1000);
 
@@ -338,6 +366,7 @@ mod tests {
 
     #[test]
     fn record_and_check_flow() {
+        stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
 
@@ -350,5 +379,21 @@ mod tests {
         let alert = mgr.check_alert(&conn).unwrap();
         assert!(alert.is_some()); // 60% crossed
         assert!(alert.unwrap().contains("60%"));
+    }
+
+    #[test]
+    fn test_low_visibility_warning() {
+        stats::reset();
+        let conn = test_conn();
+        let mut mgr = test_mgr(100_000);
+
+        stats::record_indexed(20_000);
+        stats::record_visible(500);
+
+        let alert = mgr.check_alert(&conn).unwrap();
+        assert!(alert.is_some());
+        let text = alert.unwrap();
+        assert!(text.contains("bpx visibility"));
+        assert!(text.contains("2.5%"));
     }
 }

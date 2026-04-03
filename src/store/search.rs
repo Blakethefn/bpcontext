@@ -63,13 +63,8 @@ pub fn multi_layer_search(
     if let Some(emb) = embedder {
         match emb.embed_one(query) {
             Ok(query_embedding) => {
-                let vector_results = vector_search(
-                    conn,
-                    &query_embedding,
-                    limit,
-                    source_filter,
-                    type_filter,
-                )?;
+                let vector_results =
+                    vector_search(conn, &query_embedding, limit, source_filter, type_filter)?;
                 merge_results(&mut all_results, &vector_results, weights.vector_weight);
             }
             Err(e) => {
@@ -89,7 +84,11 @@ pub fn multi_layer_search(
         apply_proximity_boost(&mut results, query);
     }
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(limit as usize);
     Ok(results)
 }
@@ -112,7 +111,7 @@ fn fts5_bm25_search(
                 bm25(chunks) as rank, COALESCE(s.label, '') as source_label
          FROM chunks
          LEFT JOIN sources s ON chunks.source_id = s.id
-         WHERE chunks MATCH ?1"
+         WHERE chunks MATCH ?1",
     );
 
     if let Some(tf) = type_filter {
@@ -125,17 +124,19 @@ fn fts5_bm25_search(
     sql.push_str(&format!(" ORDER BY rank LIMIT {limit}"));
 
     let mut stmt = conn.prepare(&sql)?;
-    let results = stmt.query_map(rusqlite::params![fts_query], |row| {
-        Ok(RankedResult {
-            title: row.get(0)?,
-            content: row.get(1)?,
-            content_type: row.get(2)?,
-            source_id: row.get(3)?,
-            rank: row.get::<_, f64>(4)?.abs(),
-            source_label: row.get(5)?,
-        })
-    })?.filter_map(|r| r.ok())
-    .collect();
+    let results = stmt
+        .query_map(rusqlite::params![fts_query], |row| {
+            Ok(RankedResult {
+                title: row.get(0)?,
+                content: row.get(1)?,
+                content_type: row.get(2)?,
+                source_id: row.get(3)?,
+                rank: row.get::<_, f64>(4)?.abs(),
+                source_label: row.get(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(results)
 }
@@ -164,11 +165,14 @@ fn trigram_search(
                 COALESCE(s.label, '') as source_label
          FROM chunks_trigram
          LEFT JOIN sources s ON chunks_trigram.source_id = s.id
-         WHERE chunks_trigram MATCH ?1"
+         WHERE chunks_trigram MATCH ?1",
     );
 
     if let Some(tf) = type_filter {
-        sql.push_str(&format!(" AND chunks_trigram.content_type = '{}'", escape_sql(tf)));
+        sql.push_str(&format!(
+            " AND chunks_trigram.content_type = '{}'",
+            escape_sql(tf)
+        ));
     }
     if let Some(sf) = source_filter {
         sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
@@ -177,17 +181,19 @@ fn trigram_search(
     sql.push_str(&format!(" ORDER BY rank LIMIT {limit}"));
 
     let mut stmt = conn.prepare(&sql)?;
-    let results = stmt.query_map(rusqlite::params![fts_query], |row| {
-        Ok(RankedResult {
-            title: row.get(0)?,
-            content: row.get(1)?,
-            content_type: row.get(2)?,
-            source_id: row.get(3)?,
-            rank: row.get::<_, f64>(4)?.abs(),
-            source_label: row.get(5)?,
-        })
-    })?.filter_map(|r| r.ok())
-    .collect();
+    let results = stmt
+        .query_map(rusqlite::params![fts_query], |row| {
+            Ok(RankedResult {
+                title: row.get(0)?,
+                content: row.get(1)?,
+                content_type: row.get(2)?,
+                source_id: row.get(3)?,
+                rank: row.get::<_, f64>(4)?.abs(),
+                source_label: row.get(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(results)
 }
@@ -231,16 +237,17 @@ fn fuzzy_search(
 /// Extract frequent terms from the FTS5 index for fuzzy matching
 fn extract_index_terms(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     // Use FTS5 vocab table to get terms
-    let result = conn.prepare(
-        "SELECT DISTINCT term FROM chunks_vocab WHERE col = 'content' LIMIT ?1"
-    );
+    let result =
+        conn.prepare("SELECT DISTINCT term FROM chunks_vocab WHERE col = 'content' LIMIT ?1");
 
     match result {
         Ok(mut stmt) => {
-            let terms = stmt.query_map(rusqlite::params![limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?.filter_map(|r| r.ok())
-            .collect();
+            let terms = stmt
+                .query_map(rusqlite::params![limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
             Ok(terms)
         }
         Err(_) => {
@@ -248,13 +255,14 @@ fn extract_index_terms(conn: &Connection, limit: usize) -> Result<Vec<String>> {
             let _ = conn.execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks, instance);"
             );
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT term FROM chunks_vocab WHERE col = 'content' LIMIT ?1"
-            )?;
-            let terms = stmt.query_map(rusqlite::params![limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?.filter_map(|r| r.ok())
-            .collect();
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT term FROM chunks_vocab WHERE col = 'content' LIMIT ?1")?;
+            let terms = stmt
+                .query_map(rusqlite::params![limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
             Ok(terms)
         }
     }
@@ -279,7 +287,7 @@ fn vector_search(
          FROM chunk_embeddings ce
          JOIN chunks c ON c.rowid = ce.chunk_rowid
          LEFT JOIN sources s ON c.source_id = s.id
-         WHERE 1=1"
+         WHERE 1=1",
     );
 
     if let Some(tf) = type_filter {
@@ -335,11 +343,7 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
 /// Merge ranked results into the accumulator using Reciprocal Rank Fusion.
 /// The `weight` multiplier scales the RRF contribution of this layer.
-fn merge_results(
-    acc: &mut HashMap<String, ScoredResult>,
-    results: &[RankedResult],
-    weight: f64,
-) {
+fn merge_results(acc: &mut HashMap<String, ScoredResult>, results: &[RankedResult], weight: f64) {
     const K: f64 = 60.0;
 
     for (rank, result) in results.iter().enumerate() {
@@ -542,13 +546,23 @@ mod tests {
         conn.execute(
             "INSERT INTO sources (label, indexed_at, chunk_count) VALUES (?1, ?2, 3)",
             rusqlite::params!["test-source", now],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert 3 chunks with different content
         let chunks = [
-            ("authentication", "login flow with JWT tokens and session management"),
-            ("database schema", "SQL tables with indexes and foreign keys"),
-            ("error handling", "retry logic with exponential backoff and circuit breaker"),
+            (
+                "authentication",
+                "login flow with JWT tokens and session management",
+            ),
+            (
+                "database schema",
+                "SQL tables with indexes and foreign keys",
+            ),
+            (
+                "error handling",
+                "retry logic with exponential backoff and circuit breaker",
+            ),
         ];
 
         for (title, content) in &chunks {
@@ -572,7 +586,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO chunk_embeddings (chunk_rowid, embedding, dim) VALUES (?1, ?2, ?3)",
                 rusqlite::params![rowid, blob, embedding.len() as i32],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         conn
@@ -606,7 +621,8 @@ mod tests {
     fn test_vector_search_ranks_by_similarity() {
         let conn = setup_vector_test_db();
         // Query very close to "authentication" chunk embedding
-        let query_emb = test_embedding("authentication login flow with JWT tokens and session management");
+        let query_emb =
+            test_embedding("authentication login flow with JWT tokens and session management");
 
         let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
         assert!(!results.is_empty());
@@ -667,9 +683,8 @@ mod tests {
         let weights = SearchWeights::default();
 
         // Should work fine without embedder — keyword layers only
-        let results = multi_layer_search(
-            &conn, "authentication", 10, None, None, None, &weights,
-        ).unwrap();
+        let results =
+            multi_layer_search(&conn, "authentication", 10, None, None, None, &weights).unwrap();
         assert!(!results.is_empty());
     }
 
@@ -682,8 +697,15 @@ mod tests {
         let embedder = MockEmbedder::new();
 
         let results = multi_layer_search(
-            &conn, "authentication", 10, None, None, Some(&embedder), &weights,
-        ).unwrap();
+            &conn,
+            "authentication",
+            10,
+            None,
+            None,
+            Some(&embedder),
+            &weights,
+        )
+        .unwrap();
         assert!(!results.is_empty());
     }
 }

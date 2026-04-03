@@ -39,31 +39,29 @@ pub fn recent_events(conn: &Connection, limit: u32) -> Result<Vec<EventRecord>> 
         "SELECT id, type, category, data, priority, created_at
          FROM events
          ORDER BY priority DESC, created_at DESC
-         LIMIT ?1"
+         LIMIT ?1",
     )?;
 
-    let events = stmt.query_map(rusqlite::params![limit], |row| {
-        Ok(EventRecord {
-            id: row.get(0)?,
-            event_type: row.get(1)?,
-            category: row.get(2)?,
-            data: row.get(3)?,
-            priority: row.get(4)?,
-            created_at: row.get(5)?,
-        })
-    })?.filter_map(|r| r.ok())
-    .collect();
+    let events = stmt
+        .query_map(rusqlite::params![limit], |row| {
+            Ok(EventRecord {
+                id: row.get(0)?,
+                event_type: row.get(1)?,
+                category: row.get(2)?,
+                data: row.get(3)?,
+                priority: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(events)
 }
 
 /// Evict oldest low-priority events when count exceeds threshold
 pub fn evict_if_needed(conn: &Connection, max_events: u32) -> Result<u32> {
-    let count: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM events",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: u32 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
 
     if count <= max_events {
         return Ok(0);
@@ -83,11 +81,7 @@ pub fn evict_if_needed(conn: &Connection, max_events: u32) -> Result<u32> {
 /// Count total events
 #[allow(dead_code)]
 pub fn event_count(conn: &Connection) -> Result<u32> {
-    let count: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM events",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: u32 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
     Ok(count)
 }
 

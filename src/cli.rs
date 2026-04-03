@@ -48,7 +48,7 @@ pub enum Commands {
         #[arg(short = 't', long)]
         content_type: Option<String>,
         /// Max results
-        #[arg(short, long, default_value = "10")]
+        #[arg(short, long, default_value = "15")]
         limit: u32,
     },
 

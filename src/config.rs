@@ -22,22 +22,50 @@ pub struct GeneralConfig {
     pub max_stdout_bytes: usize,
     /// Head/tail split ratio for truncation (default 0.6)
     pub head_ratio: f64,
+    /// Files/outputs under this size bypass truncation entirely (default 8192)
+    #[serde(default = "default_preview_threshold_bytes")]
+    pub preview_threshold_bytes: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchConfig {
-    /// Max results per query (default 10)
+    /// Max results per query (default 15)
     pub default_limit: u32,
     /// Max searches per throttle window (default 8)
     pub throttle_max: u32,
     /// Throttle window in seconds (default 60)
     pub throttle_window_secs: u64,
+    /// Max bytes per snippet for top results (default 2000)
+    #[serde(default = "default_snippet_bytes")]
+    pub snippet_bytes: usize,
+    /// Max bytes per snippet for lower-ranked results (default 800)
+    #[serde(default = "default_secondary_snippet_bytes")]
+    pub secondary_snippet_bytes: usize,
+    /// Number of top-ranked results that get the larger snippet size (default 3)
+    #[serde(default = "default_top_result_count")]
+    pub top_result_count: usize,
     /// Multiplier for vector (semantic) RRF scores (default 1.0)
     #[serde(default = "default_weight")]
     pub vector_weight: f64,
     /// Multiplier for keyword (BM25/trigram/fuzzy) RRF scores (default 1.0)
     #[serde(default = "default_weight")]
     pub keyword_weight: f64,
+}
+
+fn default_preview_threshold_bytes() -> usize {
+    8192
+}
+
+fn default_snippet_bytes() -> usize {
+    2000
+}
+
+fn default_secondary_snippet_bytes() -> usize {
+    800
+}
+
+fn default_top_result_count() -> usize {
+    3
 }
 
 fn default_weight() -> f64 {
@@ -79,7 +107,12 @@ pub struct EmbeddingsConfig {
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         let model_dir = dirs::data_local_dir()
-            .map(|d| d.join("bpcontext").join("models").to_string_lossy().to_string())
+            .map(|d| {
+                d.join("bpcontext")
+                    .join("models")
+                    .to_string_lossy()
+                    .to_string()
+            })
             .unwrap_or_else(|| "~/.local/share/bpcontext/models".to_string());
 
         Self {
@@ -108,9 +141,15 @@ pub struct ContextConfig {
     pub staleness_weight: f64,
 }
 
-fn default_recency_weight() -> f64 { 0.4 }
-fn default_frequency_weight() -> f64 { 0.3 }
-fn default_staleness_weight() -> f64 { 0.3 }
+fn default_recency_weight() -> f64 {
+    0.4
+}
+fn default_frequency_weight() -> f64 {
+    0.3
+}
+fn default_staleness_weight() -> f64 {
+    0.3
+}
 
 impl Default for ContextConfig {
     fn default() -> Self {
@@ -130,11 +169,15 @@ impl Default for Config {
             general: GeneralConfig {
                 max_stdout_bytes: 102_400,
                 head_ratio: 0.6,
+                preview_threshold_bytes: default_preview_threshold_bytes(),
             },
             search: SearchConfig {
-                default_limit: 10,
+                default_limit: 15,
                 throttle_max: 8,
                 throttle_window_secs: 60,
+                snippet_bytes: default_snippet_bytes(),
+                secondary_snippet_bytes: default_secondary_snippet_bytes(),
+                top_result_count: default_top_result_count(),
                 vector_weight: 1.0,
                 keyword_weight: 1.0,
             },
@@ -147,9 +190,7 @@ impl Default for Config {
                     .map(|h| h.join("obsidian-vault").to_string_lossy().to_string())
                     .unwrap_or_else(|| "~/obsidian-vault".to_string()),
             },
-            cleanup: CleanupConfig {
-                stale_db_days: 14,
-            },
+            cleanup: CleanupConfig { stale_db_days: 14 },
             embeddings: EmbeddingsConfig::default(),
             context: ContextConfig::default(),
         }
@@ -171,8 +212,7 @@ impl Config {
         }
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config at {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&content).context("Failed to parse config.toml")?;
+        let config: Config = toml::from_str(&content).context("Failed to parse config.toml")?;
         Ok(config)
     }
 

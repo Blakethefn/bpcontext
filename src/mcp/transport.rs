@@ -9,8 +9,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 pub fn read_message(reader: &mut BufReader<impl Read>) -> Result<Option<String>> {
     loop {
         let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line)
-            .context("Failed to read line")?;
+        let bytes_read = reader.read_line(&mut line).context("Failed to read line")?;
 
         if bytes_read == 0 {
             return Ok(None); // EOF
@@ -28,13 +27,16 @@ pub fn read_message(reader: &mut BufReader<impl Read>) -> Result<Option<String>>
 
         // Otherwise treat as Content-Length header (LSP-style framing)
         if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-            let length: usize = len_str.trim().parse()
+            let length: usize = len_str
+                .trim()
+                .parse()
                 .context("Invalid Content-Length value")?;
 
             // Consume remaining headers until empty line
             loop {
                 let mut header = String::new();
-                reader.read_line(&mut header)
+                reader
+                    .read_line(&mut header)
                     .context("Failed to read header")?;
                 if header.trim().is_empty() {
                     break;
@@ -43,11 +45,11 @@ pub fn read_message(reader: &mut BufReader<impl Read>) -> Result<Option<String>>
 
             // Read exactly `length` bytes of body
             let mut body = vec![0u8; length];
-            reader.read_exact(&mut body)
+            reader
+                .read_exact(&mut body)
                 .context("Failed to read message body")?;
 
-            let message = String::from_utf8(body)
-                .context("Message body is not valid UTF-8")?;
+            let message = String::from_utf8(body).context("Message body is not valid UTF-8")?;
 
             return Ok(Some(message));
         }

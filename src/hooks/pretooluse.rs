@@ -37,16 +37,40 @@ fn check_bash_command(tool_input: &serde_json::Value) -> Option<String> {
 
     // Commands likely to produce large output
     let large_output_patterns = [
-        "git log", "git diff", "find ", "cat ", "head -", "tail -",
-        "ls -la", "ls -R", "tree ", "npm test", "cargo test",
-        "pytest", "make ", "cargo build",
+        "git log",
+        "git diff",
+        "find ",
+        "cat ",
+        "head -",
+        "tail -",
+        "ls -la",
+        "ls -R",
+        "tree ",
+        "npm test",
+        "cargo test",
+        "pytest",
+        "make ",
+        "cargo build",
     ];
 
     // Short safe commands that should pass through
     let safe_patterns = [
-        "git status", "git branch", "git checkout", "git add", "git commit",
-        "git push", "git pull", "mkdir", "rm ", "mv ", "cp ", "cd ",
-        "echo ", "pwd", "which ", "whoami",
+        "git status",
+        "git branch",
+        "git checkout",
+        "git add",
+        "git commit",
+        "git push",
+        "git pull",
+        "mkdir",
+        "rm ",
+        "mv ",
+        "cp ",
+        "cd ",
+        "echo ",
+        "pwd",
+        "which ",
+        "whoami",
     ];
 
     // Allow safe commands through

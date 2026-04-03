@@ -37,14 +37,20 @@ pub fn build_resume_snapshot(conn: &Connection) -> Result<String> {
     });
 
     for (category, events) in sorted_cats {
-        let section = format!("### {category}\n- {} events (latest: {})\n\n",
+        let section = format!(
+            "### {category}\n- {} events (latest: {})\n\n",
             events.len(),
-            events.first().map(|e| e.created_at.as_str()).unwrap_or("unknown")
+            events
+                .first()
+                .map(|e| e.created_at.as_str())
+                .unwrap_or("unknown")
         );
 
         if current_bytes + section.len() > MAX_SNAPSHOT_BYTES {
-            snapshot.push_str(&format!("... [{} more categories]\n",
-                categories.len() - snapshot.matches("###").count()));
+            snapshot.push_str(&format!(
+                "... [{} more categories]\n",
+                categories.len() - snapshot.matches("###").count()
+            ));
             break;
         }
 

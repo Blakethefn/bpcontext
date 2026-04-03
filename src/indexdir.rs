@@ -30,9 +30,7 @@ pub fn index_directory(
 
     if let Some(pattern) = glob {
         let mut overrides = OverrideBuilder::new(path);
-        overrides
-            .add(pattern)
-            .context("invalid glob pattern")?;
+        overrides.add(pattern).context("invalid glob pattern")?;
         builder.overrides(overrides.build()?);
     }
 
@@ -87,9 +85,7 @@ pub fn index_directory(
             continue;
         }
 
-        let relative = file_path
-            .strip_prefix(path)
-            .unwrap_or(file_path);
+        let relative = file_path.strip_prefix(path).unwrap_or(file_path);
         let label = format!("{}{}", label_prefix, relative.display());
 
         let index_result = store
@@ -119,6 +115,8 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_store() -> (tempfile::TempDir, ContentStore) {
+        std::env::set_var("XDG_DATA_HOME", "/tmp/bpcontext-test-data");
+        let _ = fs::create_dir_all("/tmp/bpcontext-test-data");
         let dir = tempdir().unwrap();
         let store = ContentStore::open(dir.path()).unwrap();
         (dir, store)
@@ -175,7 +173,10 @@ mod tests {
         let (_store_dir, store) = make_store();
         let result = index_directory(&store, dir.path(), Some("*.rs"), "").unwrap();
         // *.rs should match at all depths
-        assert_eq!(result.files_indexed, 2, "glob *.rs should match nested src/lib.rs too");
+        assert_eq!(
+            result.files_indexed, 2,
+            "glob *.rs should match nested src/lib.rs too"
+        );
     }
 
     #[test]
@@ -188,7 +189,9 @@ mod tests {
         assert_eq!(result.files_indexed, 1);
 
         // Verify the label by searching
-        let search_results = store.search("content", 10, Some("myproject/file.txt"), None).unwrap();
+        let search_results = store
+            .search("content", 10, Some("myproject/file.txt"), None)
+            .unwrap();
         assert!(!search_results.is_empty());
     }
 

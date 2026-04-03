@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 
 /// Fetch a URL and convert HTML to markdown
 pub fn fetch_and_convert(url: &str) -> Result<String> {
-    let response = reqwest::blocking::get(url)
-        .with_context(|| format!("Failed to fetch URL: {url}"))?;
+    let response =
+        reqwest::blocking::get(url).with_context(|| format!("Failed to fetch URL: {url}"))?;
 
     let status = response.status();
     if !status.is_success() {

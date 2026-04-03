@@ -14,9 +14,7 @@ pub fn truncate_output(content: &str, max_bytes: usize, head_ratio: f64) -> Stri
     let tail = safe_truncate_end(content, tail_bytes);
     let omitted = content.len() - head.len() - tail.len();
 
-    format!(
-        "{head}\n\n... [{omitted} bytes omitted] ...\n\n{tail}"
-    )
+    format!("{head}\n\n... [{omitted} bytes omitted] ...\n\n{tail}")
 }
 
 /// Generate a preview (first N bytes) of content
@@ -25,7 +23,10 @@ pub fn preview(content: &str, max_bytes: usize) -> String {
         return content.to_string();
     }
     let truncated = safe_truncate(content, max_bytes);
-    format!("{truncated}\n\n... [truncated, {total} bytes total]", total = content.len())
+    format!(
+        "{truncated}\n\n... [truncated, {total} bytes total]",
+        total = content.len()
+    )
 }
 
 /// Truncate a string at a UTF-8 safe boundary from the start

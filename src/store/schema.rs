@@ -36,7 +36,7 @@ pub fn init_content_schema(conn: &Connection) -> Result<()> {
              chunk_rowid INTEGER PRIMARY KEY,
              embedding BLOB NOT NULL,
              dim INTEGER NOT NULL DEFAULT 384
-         );"
+         );",
     )?;
     Ok(())
 }
@@ -63,7 +63,7 @@ pub fn init_session_schema(conn: &Connection) -> Result<()> {
              token_estimate INTEGER NOT NULL,
              returned_at TEXT NOT NULL DEFAULT (datetime('now')),
              access_count INTEGER NOT NULL DEFAULT 1
-         );"
+         );",
     )?;
     Ok(())
 }

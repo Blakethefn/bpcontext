@@ -83,12 +83,11 @@ pub fn source_breakdown(conn: &Connection) -> Result<Vec<SourceUsage>> {
 
 /// Number of distinct sources in the ledger.
 pub fn source_count(conn: &Connection) -> Result<u32> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT source_label) FROM context_ledger",
-            [],
-            |row| row.get(0),
-        )?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT source_label) FROM context_ledger",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(count as u32)
 }
 
