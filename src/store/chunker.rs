@@ -58,11 +58,10 @@ fn classify_content(content: &str) -> ContentType {
         if trimmed.starts_with("```") {
             md_score += 1;
         }
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            if !trimmed.contains('{') && !trimmed.contains(';') {
+        if (trimmed.starts_with("- ") || trimmed.starts_with("* "))
+            && !trimmed.contains('{') && !trimmed.contains(';') {
                 md_score += 1;
             }
-        }
 
         // --- Code counter-indicators (for markdown rejection) ---
         if trimmed.contains("<?php")
@@ -102,7 +101,7 @@ fn classify_content(content: &str) -> ContentType {
     // --- Markdown check (priority) ---
     if line_count > 0 && md_score > 0 {
         let md_passes = (md_score as f64 / line_count as f64) > 0.02
-            && !(md_code_counter > md_score * 2);
+            && (md_code_counter <= md_score * 2);
         if md_passes {
             return ContentType::Markdown;
         }
@@ -137,12 +136,12 @@ pub fn chunk_content(content: &str) -> Vec<Chunk> {
     }
 }
 
-/// Check if content appears to be markdown (strict — rejects code files)
+#[cfg(test)]
 fn looks_like_markdown(content: &str) -> bool {
     classify_content(content) == ContentType::Markdown
 }
 
-/// Check if content looks like source code
+#[cfg(test)]
 fn looks_like_code(content: &str) -> bool {
     classify_content(content) == ContentType::Code
 }

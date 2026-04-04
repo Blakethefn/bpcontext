@@ -34,6 +34,7 @@ impl Default for SearchWeights {
 }
 
 /// Multi-layer search: BM25 → trigram → Levenshtein → vector → RRF fusion
+#[allow(clippy::too_many_arguments)]
 pub fn multi_layer_search(
     conn: &Connection,
     query: &str,
