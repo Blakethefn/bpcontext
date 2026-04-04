@@ -137,6 +137,9 @@ fn fts5_bm25_search(
         return Ok(Vec::new());
     }
 
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    params.push(Box::new(fts_query)); // ?1 for MATCH
+
     let mut sql = String::from(
         "SELECT chunks.title, chunks.content, chunks.content_type, chunks.source_id,
                 bm25(chunks) as rank, COALESCE(s.label, '') as source_label,
@@ -147,20 +150,25 @@ fn fts5_bm25_search(
     );
 
     if let Some(tf) = type_filter {
-        sql.push_str(&format!(" AND chunks.content_type = '{}'", escape_sql(tf)));
+        sql.push_str(&format!(" AND chunks.content_type = ?{}", params.len() + 1));
+        params.push(Box::new(tf.to_string()));
     }
     if let Some(sf) = source_filter {
-        sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
+        sql.push_str(&format!(" AND s.label LIKE ?{}", params.len() + 1));
+        params.push(Box::new(format!("%{sf}%")));
     }
     if let Some(sid) = source_id_filter {
-        sql.push_str(&format!(" AND chunks.source_id = {sid}"));
+        sql.push_str(&format!(" AND chunks.source_id = ?{}", params.len() + 1));
+        params.push(Box::new(sid));
     }
 
-    sql.push_str(&format!(" ORDER BY rank LIMIT {limit}"));
+    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", params.len() + 1));
+    params.push(Box::new(limit));
 
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(rusqlite::params![fts_query], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             Ok(RankedResult {
                 title: row.get(0)?,
                 content: row.get(1)?,
@@ -197,6 +205,9 @@ fn trigram_search(
         return Ok(Vec::new());
     }
 
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    params.push(Box::new(fts_query)); // ?1 for MATCH
+
     let mut sql = String::from(
         "SELECT chunks_trigram.title, chunks_trigram.content, chunks_trigram.content_type,
                 chunks_trigram.source_id, bm25(chunks_trigram) as rank,
@@ -209,22 +220,27 @@ fn trigram_search(
 
     if let Some(tf) = type_filter {
         sql.push_str(&format!(
-            " AND chunks_trigram.content_type = '{}'",
-            escape_sql(tf)
+            " AND chunks_trigram.content_type = ?{}",
+            params.len() + 1
         ));
+        params.push(Box::new(tf.to_string()));
     }
     if let Some(sf) = source_filter {
-        sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
+        sql.push_str(&format!(" AND s.label LIKE ?{}", params.len() + 1));
+        params.push(Box::new(format!("%{sf}%")));
     }
     if let Some(sid) = source_id_filter {
-        sql.push_str(&format!(" AND chunks_trigram.source_id = {sid}"));
+        sql.push_str(&format!(" AND chunks_trigram.source_id = ?{}", params.len() + 1));
+        params.push(Box::new(sid));
     }
 
-    sql.push_str(&format!(" ORDER BY rank LIMIT {limit}"));
+    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", params.len() + 1));
+    params.push(Box::new(limit));
 
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(rusqlite::params![fts_query], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             Ok(RankedResult {
                 title: row.get(0)?,
                 content: row.get(1)?,
@@ -333,6 +349,8 @@ fn vector_search(
     type_filter: Option<&str>,
 ) -> Result<Vec<RankedResult>> {
     // Build query to load embeddings with chunk metadata
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
     let mut sql = String::from(
         "SELECT ce.chunk_rowid, ce.embedding,
                 c.title, c.content, c.content_type, c.source_id,
@@ -345,18 +363,22 @@ fn vector_search(
     );
 
     if let Some(tf) = type_filter {
-        sql.push_str(&format!(" AND c.content_type = '{}'", escape_sql(tf)));
+        sql.push_str(&format!(" AND c.content_type = ?{}", params.len() + 1));
+        params.push(Box::new(tf.to_string()));
     }
     if let Some(sf) = source_filter {
-        sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
+        sql.push_str(&format!(" AND s.label LIKE ?{}", params.len() + 1));
+        params.push(Box::new(format!("%{sf}%")));
     }
     if let Some(sid) = source_id_filter {
-        sql.push_str(&format!(" AND c.source_id = {sid}"));
+        sql.push_str(&format!(" AND c.source_id = ?{}", params.len() + 1));
+        params.push(Box::new(sid));
     }
 
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let mut scored: Vec<(f32, RankedResult)> = stmt
-        .query_map([], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             let blob: Vec<u8> = row.get(1)?;
             Ok((
                 blob,
@@ -483,11 +505,6 @@ fn sanitize_trigram_query(query: &str) -> String {
         return String::new();
     }
     format!("\"{cleaned}\"")
-}
-
-/// Escape single quotes for SQL string interpolation
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 #[derive(Debug)]
@@ -766,6 +783,60 @@ mod tests {
         )
         .unwrap();
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_search_with_special_char_filters() {
+        let conn = setup_vector_test_db();
+
+        // A source filter containing a single quote should not cause an SQL error
+        let results = fts5_bm25_search(
+            &conn,
+            "authentication",
+            10,
+            Some("it's a test"),
+            None,
+            None,
+        );
+        assert!(results.is_ok(), "single quote in source_filter should not error");
+        assert!(results.unwrap().is_empty(), "no source matches so empty");
+
+        // A type filter containing a percent sign should not cause an SQL error
+        let results = fts5_bm25_search(
+            &conn,
+            "authentication",
+            10,
+            None,
+            None,
+            Some("100%done"),
+        );
+        assert!(results.is_ok(), "percent in type_filter should not error");
+        assert!(results.unwrap().is_empty(), "no type matches so empty");
+
+        // Also verify trigram_search handles these
+        let results = trigram_search(
+            &conn,
+            "authentication login",
+            10,
+            Some("it's a test"),
+            None,
+            None,
+        );
+        assert!(results.is_ok(), "single quote in trigram source_filter should not error");
+        assert!(results.unwrap().is_empty());
+
+        // And vector_search
+        let query_emb = test_embedding("anything");
+        let results = vector_search(
+            &conn,
+            &query_emb,
+            10,
+            Some("it's a test"),
+            None,
+            Some("100%done"),
+        );
+        assert!(results.is_ok(), "special chars in vector_search filters should not error");
+        assert!(results.unwrap().is_empty());
     }
 
     #[test]
