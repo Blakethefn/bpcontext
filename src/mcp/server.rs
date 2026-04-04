@@ -328,8 +328,13 @@ fn handle_batch_execute(args: &Value, config: &Config, store: &ContentStore) -> 
                 };
                 let (snippet, _, snippet_visible) = preview_snippet(&result.content, max_bytes);
                 visible_bytes += snippet_visible as u64;
+                let line_info = if result.line_start > 0 {
+                    format!(", lines: {}-{}", result.line_start, result.line_end)
+                } else {
+                    String::new()
+                };
                 output.push_str(&format!(
-                    "**[{}]** (source: {}, score: {:.4})\n{snippet}\n\n",
+                    "**[{}]** (source: {}, score: {:.4}{line_info})\n{snippet}\n\n",
                     result.title, result.source, result.score
                 ));
             }
@@ -381,9 +386,14 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
                     preview_snippet(&result.content, max_bytes);
                 truncated_any |= truncated;
                 visible_bytes += snippet_visible as u64;
+                let line_info = if result.line_start > 0 {
+                    format!(", lines: {}-{}", result.line_start, result.line_end)
+                } else {
+                    String::new()
+                };
                 output.push_str(&format!(
-                    "**[{}]** (source: {}, type: {}, score: {:.4})\n{snippet}\n\n",
-                    result.title, result.source, result.content_type, result.score
+                    "**[{}]** (source: {}, source_id: {}, type: {}, score: {:.4}{line_info})\n{snippet}\n\n",
+                    result.title, result.source, result.source_id, result.content_type, result.score
                 ));
             }
             if truncated_any {
@@ -503,7 +513,15 @@ fn handle_read_chunks(args: &Value, config: &Config, store: &ContentStore) -> Re
         let mut visible_bytes = 0u64;
         for result in &results {
             visible_bytes += result.content.len() as u64;
-            output.push_str(&format!("### {}\n{}\n\n", result.title, result.content));
+            let line_info = if result.line_start > 0 {
+                format!(" (lines {}-{})", result.line_start, result.line_end)
+            } else {
+                String::new()
+            };
+            output.push_str(&format!(
+                "### {}{line_info}\n{}\n\n",
+                result.title, result.content
+            ));
         }
 
         while output.ends_with('\n') {
@@ -526,7 +544,15 @@ fn handle_read_chunks(args: &Value, config: &Config, store: &ContentStore) -> Re
     let mut visible_bytes = 0u64;
     for chunk in chunks.iter().take(max_chunks) {
         visible_bytes += chunk.content.len() as u64;
-        output.push_str(&format!("### {}\n{}\n\n", chunk.title, chunk.content));
+        let line_info = if chunk.line_start > 0 {
+            format!(" (lines {}-{})", chunk.line_start, chunk.line_end)
+        } else {
+            String::new()
+        };
+        output.push_str(&format!(
+            "### {}{line_info}\n{}\n\n",
+            chunk.title, chunk.content
+        ));
     }
 
     while output.ends_with('\n') {
