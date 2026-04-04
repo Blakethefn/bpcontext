@@ -16,34 +16,38 @@ pub struct Chunk {
     pub line_end: u32,
 }
 
-/// Split content into indexable chunks
-///
-/// Strategy:
-/// - Markdown: split on headings, keep code blocks intact
-/// - Code: split on structural boundaries (functions, classes, tags)
-/// - Plain text: split on double newlines (paragraphs)
-/// - All paths enforce MAX_CHUNK_BYTES via newline fallback
-pub fn chunk_content(content: &str) -> Vec<Chunk> {
-    if looks_like_markdown(content) {
-        chunk_markdown(content)
-    } else if looks_like_code(content) {
-        chunk_code(content)
-    } else {
-        chunk_plain_text(content)
-    }
+/// Result of single-pass content classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentType {
+    Markdown,
+    Code,
+    PlainText,
 }
 
-/// Check if content appears to be markdown (strict — rejects code files)
-fn looks_like_markdown(content: &str) -> bool {
+/// Classify content in a single pass over all lines.
+///
+/// Tracks markdown indicators and code indicators simultaneously,
+/// then applies markdown-first priority: if markdown passes, return
+/// Markdown even if code would also match.
+fn classify_content(content: &str) -> ContentType {
+    // Quick structural checks for code (these inspect the whole string, not per-line)
+    let has_php_tag = content.contains("<?php") || content.contains("<?=");
+    let has_script_pair = content.contains("<script") && content.contains("</script>");
+    let has_style_pair = content.contains("<style") && content.contains("</style>");
+
     let mut md_score: u32 = 0;
-    let mut code_score: u32 = 0;
+    let mut md_code_counter: u32 = 0; // code counter-indicators for markdown rejection
     let mut line_count: u32 = 0;
+
+    let mut non_empty_lines: u32 = 0;
+    let mut code_endings: u32 = 0;
+    let mut has_func = false;
 
     for line in content.lines() {
         line_count += 1;
         let trimmed = line.trim();
 
-        // Markdown indicators: heading with space after #, code fences, list items
+        // --- Markdown indicators ---
         if trimmed.starts_with("# ")
             || trimmed.starts_with("## ")
             || trimmed.starts_with("### ")
@@ -55,13 +59,12 @@ fn looks_like_markdown(content: &str) -> bool {
             md_score += 1;
         }
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            // Only count if it doesn't look like CSS selector or pointer deref
             if !trimmed.contains('{') && !trimmed.contains(';') {
                 md_score += 1;
             }
         }
 
-        // Code counter-indicators
+        // --- Code counter-indicators (for markdown rejection) ---
         if trimmed.contains("<?php")
             || trimmed.starts_with("<script")
             || trimmed.starts_with("<style")
@@ -72,69 +75,76 @@ fn looks_like_markdown(content: &str) -> bool {
             || trimmed.starts_with("package ")
             || trimmed.starts_with("use ")
         {
-            code_score += 1;
+            md_code_counter += 1;
         }
         if trimmed.ends_with(';') || trimmed.ends_with('{') {
-            code_score += 1;
+            md_code_counter += 1;
+        }
+
+        // --- Code detection indicators ---
+        if !trimmed.is_empty() {
+            non_empty_lines += 1;
+            if trimmed.ends_with(';') || trimmed.ends_with('{') || trimmed.ends_with('}') {
+                code_endings += 1;
+            }
+            if !has_func {
+                has_func = trimmed.starts_with("function ")
+                    || trimmed.starts_with("def ")
+                    || trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.contains("function(")
+                    || trimmed.contains("function (")
+                    || trimmed.starts_with("class ");
+            }
         }
     }
 
-    if line_count == 0 {
-        return false;
+    // --- Markdown check (priority) ---
+    if line_count > 0 && md_score > 0 {
+        let md_passes = (md_score as f64 / line_count as f64) > 0.02
+            && !(md_code_counter > md_score * 2);
+        if md_passes {
+            return ContentType::Markdown;
+        }
     }
 
-    // Reject if code indicators dominate
-    if code_score > md_score * 2 {
-        return false;
+    // --- Code check ---
+    if has_php_tag || has_script_pair || has_style_pair {
+        return ContentType::Code;
+    }
+    if non_empty_lines > 0 {
+        let code_ratio = code_endings as f64 / non_empty_lines as f64;
+        if code_ratio > 0.4 || (has_func && code_endings > 5) {
+            return ContentType::Code;
+        }
     }
 
-    // Require at least some markdown presence
-    md_score > 0 && (md_score as f64 / line_count as f64) > 0.02
+    ContentType::PlainText
+}
+
+/// Split content into indexable chunks
+///
+/// Strategy:
+/// - Markdown: split on headings, keep code blocks intact
+/// - Code: split on structural boundaries (functions, classes, tags)
+/// - Plain text: split on double newlines (paragraphs)
+/// - All paths enforce MAX_CHUNK_BYTES via newline fallback
+pub fn chunk_content(content: &str) -> Vec<Chunk> {
+    match classify_content(content) {
+        ContentType::Markdown => chunk_markdown(content),
+        ContentType::Code => chunk_code(content),
+        ContentType::PlainText => chunk_plain_text(content),
+    }
+}
+
+/// Check if content appears to be markdown (strict — rejects code files)
+fn looks_like_markdown(content: &str) -> bool {
+    classify_content(content) == ContentType::Markdown
 }
 
 /// Check if content looks like source code
 fn looks_like_code(content: &str) -> bool {
-    // Quick structural checks
-    if content.contains("<?php") || content.contains("<?=") {
-        return true;
-    }
-    if content.contains("<script") && content.contains("</script>") {
-        return true;
-    }
-    if content.contains("<style") && content.contains("</style>") {
-        return true;
-    }
-
-    let mut total: u32 = 0;
-    let mut code_endings: u32 = 0;
-    let mut has_func = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        total += 1;
-        if trimmed.ends_with(';') || trimmed.ends_with('{') || trimmed.ends_with('}') {
-            code_endings += 1;
-        }
-        if !has_func {
-            has_func = trimmed.starts_with("function ")
-                || trimmed.starts_with("def ")
-                || trimmed.starts_with("fn ")
-                || trimmed.starts_with("pub fn ")
-                || trimmed.contains("function(")
-                || trimmed.contains("function (")
-                || trimmed.starts_with("class ");
-        }
-    }
-
-    if total == 0 {
-        return false;
-    }
-
-    // >40% of non-empty lines end with code terminators
-    (code_endings as f64 / total as f64) > 0.4 || (has_func && code_endings > 5)
+    classify_content(content) == ContentType::Code
 }
 
 /// Check if a line is a structural boundary in code
@@ -565,40 +575,42 @@ fn split_at_newlines_with_lines(
 
 /// Heuristic: does this content look like code?
 fn detect_code(content: &str) -> bool {
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.is_empty() {
-        return false;
-    }
-
     // Contains code fences
     if content.contains("```") {
         return true;
     }
 
-    // >60% of lines start with common code patterns
-    let code_lines = lines
-        .iter()
-        .filter(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with("fn ")
-                || trimmed.starts_with("pub ")
-                || trimmed.starts_with("let ")
-                || trimmed.starts_with("const ")
-                || trimmed.starts_with("import ")
-                || trimmed.starts_with("from ")
-                || trimmed.starts_with("def ")
-                || trimmed.starts_with("class ")
-                || trimmed.starts_with("//")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with('#')
-                || trimmed.starts_with('{')
-                || trimmed.starts_with('}')
-                || trimmed.ends_with(';')
-                || trimmed.ends_with('{')
-        })
-        .count();
+    let mut total_lines: u32 = 0;
+    let mut code_lines: u32 = 0;
 
-    code_lines as f64 / lines.len() as f64 > 0.6
+    for line in content.lines() {
+        total_lines += 1;
+        let trimmed = line.trim();
+        if trimmed.starts_with("fn ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("const ")
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("def ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('{')
+            || trimmed.starts_with('}')
+            || trimmed.ends_with(';')
+            || trimmed.ends_with('{')
+        {
+            code_lines += 1;
+        }
+    }
+
+    if total_lines == 0 {
+        return false;
+    }
+
+    code_lines as f64 / total_lines as f64 > 0.6
 }
 
 #[cfg(test)]
