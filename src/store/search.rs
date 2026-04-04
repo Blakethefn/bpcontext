@@ -14,6 +14,8 @@ pub struct SearchResult {
     pub source_id: i64,
     pub score: f64,
     pub source: String,
+    pub line_start: u32,
+    pub line_end: u32,
 }
 
 /// Weight configuration for RRF layer blending
@@ -137,7 +139,8 @@ fn fts5_bm25_search(
 
     let mut sql = String::from(
         "SELECT chunks.title, chunks.content, chunks.content_type, chunks.source_id,
-                bm25(chunks) as rank, COALESCE(s.label, '') as source_label
+                bm25(chunks) as rank, COALESCE(s.label, '') as source_label,
+                chunks.line_start, chunks.line_end
          FROM chunks
          LEFT JOIN sources s ON chunks.source_id = s.id
          WHERE chunks MATCH ?1",
@@ -165,6 +168,8 @@ fn fts5_bm25_search(
                 source_id: row.get(3)?,
                 rank: row.get::<_, f64>(4)?.abs(),
                 source_label: row.get(5)?,
+                line_start: row.get::<_, i64>(6).unwrap_or(0) as u32,
+                line_end: row.get::<_, i64>(7).unwrap_or(0) as u32,
             })
         })?
         .filter_map(|r| r.ok())
@@ -195,7 +200,8 @@ fn trigram_search(
     let mut sql = String::from(
         "SELECT chunks_trigram.title, chunks_trigram.content, chunks_trigram.content_type,
                 chunks_trigram.source_id, bm25(chunks_trigram) as rank,
-                COALESCE(s.label, '') as source_label
+                COALESCE(s.label, '') as source_label,
+                chunks_trigram.line_start, chunks_trigram.line_end
          FROM chunks_trigram
          LEFT JOIN sources s ON chunks_trigram.source_id = s.id
          WHERE chunks_trigram MATCH ?1",
@@ -226,6 +232,8 @@ fn trigram_search(
                 source_id: row.get(3)?,
                 rank: row.get::<_, f64>(4)?.abs(),
                 source_label: row.get(5)?,
+                line_start: row.get::<_, i64>(6).unwrap_or(0) as u32,
+                line_end: row.get::<_, i64>(7).unwrap_or(0) as u32,
             })
         })?
         .filter_map(|r| r.ok())
@@ -328,7 +336,8 @@ fn vector_search(
     let mut sql = String::from(
         "SELECT ce.chunk_rowid, ce.embedding,
                 c.title, c.content, c.content_type, c.source_id,
-                COALESCE(s.label, '') as source_label
+                COALESCE(s.label, '') as source_label,
+                c.line_start, c.line_end
          FROM chunk_embeddings ce
          JOIN chunks c ON c.rowid = ce.chunk_rowid
          LEFT JOIN sources s ON c.source_id = s.id
@@ -358,6 +367,8 @@ fn vector_search(
                     source_id: row.get(5)?,
                     rank: 0.0, // will be set after sorting
                     source_label: row.get(6)?,
+                    line_start: row.get::<_, i64>(7).unwrap_or(0) as u32,
+                    line_end: row.get::<_, i64>(8).unwrap_or(0) as u32,
                 },
             ))
         })?
@@ -407,6 +418,8 @@ fn merge_results(acc: &mut HashMap<String, ScoredResult>, results: &[RankedResul
                 source_id: result.source_id,
                 source_label: result.source_label.clone(),
                 rrf_score,
+                line_start: result.line_start,
+                line_end: result.line_end,
             });
     }
 }
@@ -486,6 +499,8 @@ struct RankedResult {
     source_id: i64,
     rank: f64,
     source_label: String,
+    line_start: u32,
+    line_end: u32,
 }
 
 struct ScoredResult {
@@ -495,6 +510,8 @@ struct ScoredResult {
     source_id: i64,
     source_label: String,
     rrf_score: f64,
+    line_start: u32,
+    line_end: u32,
 }
 
 impl ScoredResult {
@@ -506,6 +523,8 @@ impl ScoredResult {
             source_id: self.source_id,
             score: self.rrf_score,
             source: self.source_label,
+            line_start: self.line_start,
+            line_end: self.line_end,
         }
     }
 }
@@ -572,6 +591,8 @@ mod tests {
             source_id: 1,
             rank: 0.0,
             source_label: "src".to_string(),
+            line_start: 0,
+            line_end: 0,
         }];
 
         // Weight 1.0: rank 0 → 1/(60+0+1) = 0.01639...
@@ -615,14 +636,14 @@ mod tests {
 
         for (title, content) in &chunks {
             conn.execute(
-                "INSERT INTO chunks (title, content, content_type, source_id) VALUES (?1, ?2, 'prose', 1)",
+                "INSERT INTO chunks (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, 'prose', 1, 0, 0)",
                 rusqlite::params![title, content],
             ).unwrap();
 
             let rowid = conn.last_insert_rowid();
 
             conn.execute(
-                "INSERT INTO chunks_trigram (title, content, content_type, source_id) VALUES (?1, ?2, 'prose', 1)",
+                "INSERT INTO chunks_trigram (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, 'prose', 1, 0, 0)",
                 rusqlite::params![title, content],
             ).unwrap();
 
@@ -767,5 +788,54 @@ mod tests {
         )
         .unwrap();
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn test_search_results_include_line_numbers() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::schema::init_content_schema(&conn).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sources (label, indexed_at, chunk_count) VALUES (?1, ?2, 1)",
+            rusqlite::params!["line-test-source", now],
+        )
+        .unwrap();
+
+        // Insert a chunk with explicit line numbers
+        conn.execute(
+            "INSERT INTO chunks (title, content, content_type, source_id, line_start, line_end) \
+             VALUES (?1, ?2, 'prose', 1, 10, 25)",
+            rusqlite::params![
+                "line number test",
+                "unique phrase for line number verification"
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO chunks_trigram (title, content, content_type, source_id, line_start, line_end) \
+             VALUES (?1, ?2, 'prose', 1, 10, 25)",
+            rusqlite::params!["line number test", "unique phrase for line number verification"],
+        )
+        .unwrap();
+
+        let weights = SearchWeights::default();
+        let results = multi_layer_search(
+            &conn,
+            "unique phrase line number verification",
+            10,
+            None,
+            None,
+            None,
+            None,
+            &weights,
+        )
+        .unwrap();
+
+        assert!(!results.is_empty(), "search should return results");
+        let result = &results[0];
+        assert_eq!(result.line_start, 10, "line_start should be 10");
+        assert_eq!(result.line_end, 25, "line_end should be 25");
     }
 }
