@@ -302,6 +302,7 @@ fn main() -> Result<()> {
             let dim = emb.dim() as i32;
             let mut total = 0usize;
 
+            conn.execute_batch("BEGIN")?;
             for batch in missing.chunks(batch_size) {
                 let texts: Vec<String> = batch
                     .iter()
@@ -322,6 +323,7 @@ fn main() -> Result<()> {
                 total += batch.len();
                 println!("  {} {} / {}", "->".green(), total, missing.len());
             }
+            conn.execute_batch("COMMIT")?;
 
             println!(
                 "{} Backfilled embeddings for {} chunks.",
