@@ -46,33 +46,16 @@ pub fn execute_command(
     let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let original_bytes = raw_stdout.len() + raw_stderr.len();
 
-    let combined = if raw_stderr.is_empty() {
+    let truncated = raw_stdout.len() > max_bytes;
+    let stdout = if truncated {
+        truncate_output(&raw_stdout, max_bytes, head_ratio)
+    } else {
         raw_stdout
-    } else {
-        format!("{raw_stdout}\n--- stderr ---\n{raw_stderr}")
-    };
-
-    let truncated = combined.len() > max_bytes;
-    let final_output = if truncated {
-        truncate_output(&combined, max_bytes, head_ratio)
-    } else {
-        combined.clone()
-    };
-
-    // Split back into stdout/stderr for the result
-    let (stdout, stderr) = if final_output.contains("\n--- stderr ---\n") {
-        let parts: Vec<&str> = final_output.splitn(2, "\n--- stderr ---\n").collect();
-        (
-            parts[0].to_string(),
-            parts.get(1).unwrap_or(&"").to_string(),
-        )
-    } else {
-        (final_output, String::new())
     };
 
     Ok(ExecResult {
         stdout,
-        stderr,
+        stderr: raw_stderr,
         exit_code: output.status.code(),
         truncated,
         original_bytes,

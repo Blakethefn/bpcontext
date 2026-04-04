@@ -239,7 +239,7 @@ fn handle_execute(args: &Value, config: &Config, store: &ContentStore) -> Result
     )?;
 
     let full_output = if result.stderr.is_empty() {
-        result.stdout.clone()
+        result.stdout
     } else {
         format!("{}\n--- stderr ---\n{}", result.stdout, result.stderr)
     };
@@ -290,7 +290,7 @@ fn handle_batch_execute(args: &Value, config: &Config, store: &ContentStore) -> 
         )?;
 
         let full = if result.stderr.is_empty() {
-            result.stdout.clone()
+            result.stdout
         } else {
             format!("{}\n--- stderr ---\n{}", result.stdout, result.stderr)
         };

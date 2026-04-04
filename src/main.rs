@@ -60,7 +60,7 @@ fn main() -> Result<()> {
             )?;
 
             let full_output = if result.stderr.is_empty() {
-                result.stdout.clone()
+                result.stdout
             } else {
                 format!("{}\n--- stderr ---\n{}", result.stdout, result.stderr)
             };
