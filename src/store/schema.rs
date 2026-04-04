@@ -61,8 +61,10 @@ pub fn migrate_add_line_columns(conn: &Connection) -> Result<()> {
     }
 
     // Drop and recreate both FTS5 tables with the new columns.
+    // Also clear chunk_embeddings since their chunk_rowids are now stale.
     conn.execute_batch(
-        "DROP TABLE IF EXISTS chunks;
+        "DELETE FROM chunk_embeddings;
+         DROP TABLE IF EXISTS chunks;
          DROP TABLE IF EXISTS chunks_trigram;
 
          CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(

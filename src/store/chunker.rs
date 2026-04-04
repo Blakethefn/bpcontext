@@ -5,8 +5,6 @@ const MAX_CHUNK_BYTES: usize = 4096;
 const MIN_CHUNK_BYTES: usize = 256;
 
 /// A chunk of content ready for indexing
-// line_start and line_end will be read by the store layer once DB schema is updated (task 2+)
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Chunk {
     pub title: String,

@@ -37,6 +37,7 @@ pub fn multi_layer_search(
     query: &str,
     limit: u32,
     source_filter: Option<&str>,
+    source_id_filter: Option<i64>,
     type_filter: Option<&str>,
     embedder: Option<&dyn Embed>,
     weights: &SearchWeights,
@@ -44,18 +45,39 @@ pub fn multi_layer_search(
     let mut all_results: HashMap<String, ScoredResult> = HashMap::new();
 
     // Layer 1: FTS5 BM25 with Porter stemming
-    let bm25_results = fts5_bm25_search(conn, query, limit, source_filter, type_filter)?;
+    let bm25_results = fts5_bm25_search(
+        conn,
+        query,
+        limit,
+        source_filter,
+        source_id_filter,
+        type_filter,
+    )?;
     merge_results(&mut all_results, &bm25_results, weights.keyword_weight);
 
     // Layer 2: Trigram search (if BM25 returned fewer than limit)
     if bm25_results.len() < limit as usize {
-        let trigram_results = trigram_search(conn, query, limit, source_filter, type_filter)?;
+        let trigram_results = trigram_search(
+            conn,
+            query,
+            limit,
+            source_filter,
+            source_id_filter,
+            type_filter,
+        )?;
         merge_results(&mut all_results, &trigram_results, weights.keyword_weight);
     }
 
     // Layer 3: Levenshtein fuzzy correction (if still too few results)
     if all_results.len() < limit as usize {
-        let fuzzy_results = fuzzy_search(conn, query, limit, source_filter, type_filter)?;
+        let fuzzy_results = fuzzy_search(
+            conn,
+            query,
+            limit,
+            source_filter,
+            source_id_filter,
+            type_filter,
+        )?;
         merge_results(&mut all_results, &fuzzy_results, weights.keyword_weight);
     }
 
@@ -63,8 +85,14 @@ pub fn multi_layer_search(
     if let Some(emb) = embedder {
         match emb.embed_one(query) {
             Ok(query_embedding) => {
-                let vector_results =
-                    vector_search(conn, &query_embedding, limit, source_filter, type_filter)?;
+                let vector_results = vector_search(
+                    conn,
+                    &query_embedding,
+                    limit,
+                    source_filter,
+                    source_id_filter,
+                    type_filter,
+                )?;
                 merge_results(&mut all_results, &vector_results, weights.vector_weight);
             }
             Err(e) => {
@@ -99,6 +127,7 @@ fn fts5_bm25_search(
     query: &str,
     limit: u32,
     source_filter: Option<&str>,
+    source_id_filter: Option<i64>,
     type_filter: Option<&str>,
 ) -> Result<Vec<RankedResult>> {
     let fts_query = sanitize_fts_query(query);
@@ -119,6 +148,9 @@ fn fts5_bm25_search(
     }
     if let Some(sf) = source_filter {
         sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
+    }
+    if let Some(sid) = source_id_filter {
+        sql.push_str(&format!(" AND chunks.source_id = {sid}"));
     }
 
     sql.push_str(&format!(" ORDER BY rank LIMIT {limit}"));
@@ -147,6 +179,7 @@ fn trigram_search(
     query: &str,
     limit: u32,
     source_filter: Option<&str>,
+    source_id_filter: Option<i64>,
     type_filter: Option<&str>,
 ) -> Result<Vec<RankedResult>> {
     // Trigram requires at least 3 characters
@@ -177,6 +210,9 @@ fn trigram_search(
     if let Some(sf) = source_filter {
         sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
     }
+    if let Some(sid) = source_id_filter {
+        sql.push_str(&format!(" AND chunks_trigram.source_id = {sid}"));
+    }
 
     sql.push_str(&format!(" ORDER BY rank LIMIT {limit}"));
 
@@ -204,6 +240,7 @@ fn fuzzy_search(
     query: &str,
     limit: u32,
     source_filter: Option<&str>,
+    source_id_filter: Option<i64>,
     type_filter: Option<&str>,
 ) -> Result<Vec<RankedResult>> {
     // Extract unique terms from the index to find close matches
@@ -231,7 +268,14 @@ fn fuzzy_search(
         return Ok(Vec::new()); // No corrections found
     }
 
-    fts5_bm25_search(conn, &corrected_query, limit, source_filter, type_filter)
+    fts5_bm25_search(
+        conn,
+        &corrected_query,
+        limit,
+        source_filter,
+        source_id_filter,
+        type_filter,
+    )
 }
 
 /// Extract frequent terms from the FTS5 index for fuzzy matching
@@ -277,6 +321,7 @@ fn vector_search(
     query_embedding: &[f32],
     limit: u32,
     source_filter: Option<&str>,
+    source_id_filter: Option<i64>,
     type_filter: Option<&str>,
 ) -> Result<Vec<RankedResult>> {
     // Build query to load embeddings with chunk metadata
@@ -295,6 +340,9 @@ fn vector_search(
     }
     if let Some(sf) = source_filter {
         sql.push_str(&format!(" AND s.label LIKE '%{}%'", escape_sql(sf)));
+    }
+    if let Some(sid) = source_id_filter {
+        sql.push_str(&format!(" AND c.source_id = {sid}"));
     }
 
     let mut stmt = conn.prepare(&sql)?;
@@ -612,7 +660,7 @@ mod tests {
         let conn = setup_vector_test_db();
         let query_emb = test_embedding("authentication login JWT");
 
-        let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None).unwrap();
         assert!(!results.is_empty(), "vector search should return results");
         assert!(results.len() <= 3, "should not exceed chunk count");
     }
@@ -624,7 +672,7 @@ mod tests {
         let query_emb =
             test_embedding("authentication login flow with JWT tokens and session management");
 
-        let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None).unwrap();
         assert!(!results.is_empty());
         // First result should be the "authentication" chunk (most similar)
         assert_eq!(results[0].title, "authentication");
@@ -635,7 +683,7 @@ mod tests {
         let conn = setup_vector_test_db();
         let query_emb = test_embedding("anything");
 
-        let results = vector_search(&conn, &query_emb, 1, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 1, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -645,11 +693,13 @@ mod tests {
         let query_emb = test_embedding("anything");
 
         // Filter by existing source
-        let results = vector_search(&conn, &query_emb, 10, Some("test-source"), None).unwrap();
+        let results =
+            vector_search(&conn, &query_emb, 10, Some("test-source"), None, None).unwrap();
         assert!(!results.is_empty());
 
         // Filter by non-existing source
-        let results = vector_search(&conn, &query_emb, 10, Some("nonexistent"), None).unwrap();
+        let results =
+            vector_search(&conn, &query_emb, 10, Some("nonexistent"), None, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -659,11 +709,11 @@ mod tests {
         let query_emb = test_embedding("anything");
 
         // Filter by existing type
-        let results = vector_search(&conn, &query_emb, 10, None, Some("prose")).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, Some("prose")).unwrap();
         assert!(!results.is_empty());
 
         // Filter by non-existing type
-        let results = vector_search(&conn, &query_emb, 10, None, Some("code")).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, Some("code")).unwrap();
         assert!(results.is_empty());
     }
 
@@ -673,7 +723,7 @@ mod tests {
         super::super::schema::init_content_schema(&conn).unwrap();
 
         let query_emb = vec![0.1f32; 16];
-        let results = vector_search(&conn, &query_emb, 10, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -683,8 +733,17 @@ mod tests {
         let weights = SearchWeights::default();
 
         // Should work fine without embedder — keyword layers only
-        let results =
-            multi_layer_search(&conn, "authentication", 10, None, None, None, &weights).unwrap();
+        let results = multi_layer_search(
+            &conn,
+            "authentication",
+            10,
+            None,
+            None,
+            None,
+            None,
+            &weights,
+        )
+        .unwrap();
         assert!(!results.is_empty());
     }
 
@@ -700,6 +759,7 @@ mod tests {
             &conn,
             "authentication",
             10,
+            None,
             None,
             None,
             Some(&embedder),
