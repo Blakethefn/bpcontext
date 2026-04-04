@@ -44,7 +44,7 @@ pub fn multi_layer_search(
     embedder: Option<&dyn Embed>,
     weights: &SearchWeights,
 ) -> Result<Vec<SearchResult>> {
-    let mut all_results: HashMap<String, ScoredResult> = HashMap::new();
+    let mut all_results: HashMap<(i64, String), ScoredResult> = HashMap::new();
 
     // Layer 1: FTS5 BM25 with Porter stemming
     let bm25_results = fts5_bm25_search(
@@ -459,12 +459,12 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
 /// Merge ranked results into the accumulator using Reciprocal Rank Fusion.
 /// The `weight` multiplier scales the RRF contribution of this layer.
-fn merge_results(acc: &mut HashMap<String, ScoredResult>, results: &[RankedResult], weight: f64) {
+fn merge_results(acc: &mut HashMap<(i64, String), ScoredResult>, results: &[RankedResult], weight: f64) {
     const K: f64 = 60.0;
 
     for (rank, result) in results.iter().enumerate() {
         let rrf_score = weight * (1.0 / (K + rank as f64 + 1.0));
-        let key = format!("{}:{}", result.source_id, result.title);
+        let key = (result.source_id, result.title.clone());
 
         acc.entry(key)
             .and_modify(|sr| {
@@ -523,20 +523,24 @@ fn apply_proximity_boost(results: &mut [SearchResult], query: &str) {
 
 /// Sanitize a query for FTS5 MATCH syntax
 fn sanitize_fts_query(query: &str) -> String {
-    // Remove FTS5 special characters, keep words
-    query
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == ' ' || c == '_' || c == '-' {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<&str>>()
-        .join(" ")
+    let mut result = String::with_capacity(query.len());
+    let mut last_was_space = true;
+
+    for c in query.chars() {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            result.push(c);
+            last_was_space = false;
+        } else if !last_was_space {
+            result.push(' ');
+            last_was_space = true;
+        }
+    }
+
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
+    result
 }
 
 /// Sanitize a query for trigram FTS5 MATCH
@@ -644,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_merge_results_with_weight() {
-        let mut acc: HashMap<String, ScoredResult> = HashMap::new();
+        let mut acc: HashMap<(i64, String), ScoredResult> = HashMap::new();
         let results = vec![RankedResult {
             title: "test".to_string(),
             content: "content".to_string(),
@@ -661,7 +665,7 @@ mod tests {
         merge_results(&mut acc, &results, 1.0);
         let score_w1 = acc.values().next().unwrap().rrf_score;
 
-        let mut acc2: HashMap<String, ScoredResult> = HashMap::new();
+        let mut acc2: HashMap<(i64, String), ScoredResult> = HashMap::new();
         merge_results(&mut acc2, &results, 2.0);
         let score_w2 = acc2.values().next().unwrap().rrf_score;
 
