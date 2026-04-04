@@ -5,6 +5,8 @@ const MAX_CHUNK_BYTES: usize = 4096;
 const MIN_CHUNK_BYTES: usize = 256;
 
 /// A chunk of content ready for indexing
+// line_start and line_end will be read by the store layer once DB schema is updated (task 2+)
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Chunk {
     pub title: String,
@@ -282,7 +284,13 @@ fn chunk_markdown(content: &str) -> Vec<Chunk> {
             if !current_lines.is_empty() {
                 let body = current_lines.join("\n");
                 let chunk_line_end = line_number - 1;
-                flush_chunk_with_lines(&mut chunks, &current_title, &body, chunk_line_start, chunk_line_end);
+                flush_chunk_with_lines(
+                    &mut chunks,
+                    &current_title,
+                    &body,
+                    chunk_line_start,
+                    chunk_line_end,
+                );
                 current_lines.clear();
             }
             current_title = line.trim_start_matches('#').trim().to_string();
@@ -296,7 +304,13 @@ fn chunk_markdown(content: &str) -> Vec<Chunk> {
     // Flush final section
     if !current_lines.is_empty() {
         let body = current_lines.join("\n");
-        flush_chunk_with_lines(&mut chunks, &current_title, &body, chunk_line_start, line_number);
+        flush_chunk_with_lines(
+            &mut chunks,
+            &current_title,
+            &body,
+            chunk_line_start,
+            line_number,
+        );
     }
 
     if chunks.is_empty() {
@@ -328,7 +342,6 @@ fn chunk_plain_text(content: &str) -> Vec<Chunk> {
         let para_lines = para.lines().count() as u32;
 
         if para_trimmed.is_empty() {
-            cumulative_lines += para_lines + 2; // +2 for the \n\n separator
             continue;
         }
 
@@ -419,7 +432,9 @@ fn flush_chunk_with_lines(
 
         if current.len() + para.len() + 2 > MAX_CHUNK_BYTES && !current.is_empty() {
             part += 1;
-            let part_line_end = (line_start + para_line_offset).saturating_sub(1).max(part_line_start);
+            let part_line_end = (line_start + para_line_offset)
+                .saturating_sub(1)
+                .max(part_line_start);
             let taken = std::mem::take(&mut current);
             if taken.len() > MAX_CHUNK_BYTES {
                 split_at_newlines_with_lines(
@@ -463,16 +478,10 @@ fn flush_chunk_with_lines(
                 content: current,
                 is_code,
                 line_start: part_line_start,
-                line_end: line_end,
+                line_end,
             });
         }
     }
-}
-
-/// Flush accumulated content as one or more chunks (legacy, uses 0/0 for line info)
-#[allow(dead_code)]
-fn flush_chunk(chunks: &mut Vec<Chunk>, title: &str, content: &str) {
-    flush_chunk_with_lines(chunks, title, content, 0, 0);
 }
 
 /// Hard split at single newline boundaries with line number tracking
@@ -492,7 +501,11 @@ fn split_at_newlines_with_lines(
         // +1 for the newline we'll add
         if current.len() + line.len() + 1 > MAX_CHUNK_BYTES && !current.is_empty() {
             part += 1;
-            let part_line_end = (base_line_start + line_offset).saturating_sub(2).max(part_line_start);
+            // line_offset is 1-based and has already advanced past the overflow line,
+            // so subtract 2 to get the last line actually included in the current chunk.
+            let part_line_end = (base_line_start + line_offset)
+                .saturating_sub(2)
+                .max(part_line_start);
             let taken = std::mem::take(&mut current);
             let is_code = detect_code(&taken);
             chunks.push(Chunk {
@@ -550,12 +563,6 @@ fn split_at_newlines_with_lines(
             line_end: part_line_end,
         });
     }
-}
-
-/// Hard split at single newline boundaries, guaranteeing MAX_CHUNK_BYTES (legacy, uses 0 for line info)
-#[allow(dead_code)]
-fn split_at_newlines(title: &str, content: &str, chunks: &mut Vec<Chunk>) {
-    split_at_newlines_with_lines(title, content, chunks, 0);
 }
 
 /// Heuristic: does this content look like code?
@@ -757,24 +764,42 @@ mod tests {
         let chunks = chunk_code(content);
         assert!(!chunks.is_empty());
         for chunk in &chunks {
-            assert!(chunk.line_start > 0, "line_start should be > 0 for code chunks");
-            assert!(chunk.line_end >= chunk.line_start, "line_end should be >= line_start");
+            assert!(
+                chunk.line_start > 0,
+                "line_start should be > 0 for code chunks"
+            );
+            assert!(
+                chunk.line_end >= chunk.line_start,
+                "line_end should be >= line_start"
+            );
         }
         // First chunk should start at line 1
-        assert_eq!(chunks[0].line_start, 1, "First chunk should start at line 1");
+        assert_eq!(
+            chunks[0].line_start, 1,
+            "First chunk should start at line 1"
+        );
     }
 
     #[test]
     fn test_markdown_chunks_have_line_numbers() {
         let md = "# Section One\nFirst section content.\nMore content here.\n## Section Two\nSecond section content.\nEven more content.\n### Subsection\nSubsection content.";
         let chunks = chunk_markdown(md);
-        assert!(chunks.len() >= 2, "Expected at least 2 chunks from markdown with headings");
+        assert!(
+            chunks.len() >= 2,
+            "Expected at least 2 chunks from markdown with headings"
+        );
         // First chunk should start at line 1
-        assert_eq!(chunks[0].line_start, 1, "First markdown chunk should start at line 1");
+        assert_eq!(
+            chunks[0].line_start, 1,
+            "First markdown chunk should start at line 1"
+        );
         // Each chunk should have valid line numbers
         for chunk in &chunks {
             assert!(chunk.line_start > 0, "line_start should be > 0");
-            assert!(chunk.line_end >= chunk.line_start, "line_end should be >= line_start");
+            assert!(
+                chunk.line_end >= chunk.line_start,
+                "line_end should be >= line_start"
+            );
         }
         // Chunks should be in ascending order
         for i in 1..chunks.len() {
@@ -791,10 +816,16 @@ mod tests {
         let chunks = chunk_plain_text(text);
         assert!(!chunks.is_empty());
         // First chunk should start at line 1
-        assert_eq!(chunks[0].line_start, 1, "First plain text chunk should start at line 1");
+        assert_eq!(
+            chunks[0].line_start, 1,
+            "First plain text chunk should start at line 1"
+        );
         for chunk in &chunks {
-            assert!(chunk.line_start > 0 || chunks.len() == 1, "line_start should be > 0");
-            assert!(chunk.line_end >= chunk.line_start, "line_end should be >= line_start");
+            assert!(chunk.line_start > 0, "line_start should be > 0");
+            assert!(
+                chunk.line_end >= chunk.line_start,
+                "line_end should be >= line_start"
+            );
         }
     }
 
@@ -810,8 +841,8 @@ mod tests {
         // Last chunk ends at or near total line count
         let last = chunks.last().unwrap();
         assert!(
-            last.line_end >= total_lines - 1,
-            "Last chunk line_end ({}) should be near total lines ({})",
+            last.line_end >= total_lines,
+            "Last chunk line_end ({}) should cover total lines ({})",
             last.line_end,
             total_lines
         );
