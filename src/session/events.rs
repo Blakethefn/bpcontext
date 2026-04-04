@@ -86,10 +86,15 @@ pub fn event_count(conn: &Connection) -> Result<u32> {
 }
 
 fn compute_hash(data: &str) -> String {
+    use std::fmt::Write;
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
+    let mut s = String::with_capacity(64);
+    for b in result.iter() {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 #[derive(Debug)]

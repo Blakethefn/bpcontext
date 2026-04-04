@@ -91,7 +91,13 @@ pub fn cleanup_stale_dbs(stale_days: u64) -> Result<u32> {
 
 /// Hex encoding helper (avoids adding the hex crate)
 mod hex {
+    use std::fmt::Write;
+
     pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
     }
 }
