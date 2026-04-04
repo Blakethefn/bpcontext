@@ -59,7 +59,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "bpx_search",
-                "description": "Search indexed content using multi-layer search (BM25, trigram, fuzzy, semantic vector similarity).",
+                "description": "Primary retrieval tool after indexing. Search indexed content using multi-layer search and use the returned source_id for exact follow-up reads via bpx_read_chunks. REVIEW RULE: bpx_search is for discovery, not for repo-wide claims. Before stating 'no endpoint checks X' or 'all routes do Y', you MUST confirm with exact reads (Read tool or bpx_read_chunks) on the specific files. Search results show where matches exist — absence from results does NOT prove absence from the codebase.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

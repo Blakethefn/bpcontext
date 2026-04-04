@@ -404,6 +404,22 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
         }
     }
 
+    // Negative-claim warning for broad queries
+    let is_broad = source.is_none()
+        && queries.len() == 1
+        && queries[0]
+            .as_str()
+            .map_or(false, |q| q.split_whitespace().count() <= 2);
+
+    if is_broad {
+        output.push_str(
+            "**Review note:** These results show where matches were found, not where they are absent. \
+             Do not infer \"no endpoint checks X\" or \"all routes do Y\" from search results alone. \
+             Use the native Read tool on specific files to confirm presence or absence before making \
+             severity claims.\n\n"
+        );
+    }
+
     stats::record_visible(visible_bytes);
     stats::record_returned(output.len() as u64);
     Ok(output)
