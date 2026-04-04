@@ -83,75 +83,91 @@ impl ContentStore {
         content_type: Option<&str>,
     ) -> Result<IndexResult> {
         let chunks = chunker::chunk_content(content);
-        let now = chrono::Utc::now().to_rfc3339();
 
-        let source_id: i64 = self.conn.query_row(
-            "INSERT INTO sources (label, indexed_at) VALUES (?1, ?2) RETURNING id",
-            rusqlite::params![label, now],
-            |row| row.get(0),
-        )?;
+        self.conn.execute_batch("BEGIN")?;
 
-        let mut chunk_count = 0u32;
-        let mut code_chunk_count = 0u32;
-        let mut chunk_rowids: Vec<i64> = Vec::with_capacity(chunks.len());
-        let mut embed_texts: Vec<String> = Vec::with_capacity(chunks.len());
+        let result = (|| -> Result<IndexResult> {
+            let now = chrono::Utc::now().to_rfc3339();
 
-        for chunk in &chunks {
-            let ct = content_type.unwrap_or(if chunk.is_code { "code" } else { "prose" });
-
-            // Insert into primary FTS5 table
-            self.conn.execute(
-                "INSERT INTO chunks (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![chunk.title, chunk.content, ct, source_id, chunk.line_start, chunk.line_end],
+            let source_id: i64 = self.conn.query_row(
+                "INSERT INTO sources (label, indexed_at) VALUES (?1, ?2) RETURNING id",
+                rusqlite::params![label, now],
+                |row| row.get(0),
             )?;
 
-            let rowid = self.conn.last_insert_rowid();
+            let mut chunk_count = 0u32;
+            let mut code_chunk_count = 0u32;
+            let mut chunk_rowids: Vec<i64> = Vec::with_capacity(chunks.len());
+            let mut embed_texts: Vec<String> = Vec::with_capacity(chunks.len());
 
-            // Insert into trigram table
-            self.conn.execute(
-                "INSERT INTO chunks_trigram (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![chunk.title, chunk.content, ct, source_id, chunk.line_start, chunk.line_end],
-            )?;
+            for chunk in &chunks {
+                let ct = content_type.unwrap_or(if chunk.is_code { "code" } else { "prose" });
 
-            chunk_rowids.push(rowid);
-            embed_texts.push(format!("{} {}", chunk.title, chunk.content));
+                // Insert into primary FTS5 table
+                self.conn.execute(
+                    "INSERT INTO chunks (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![chunk.title, chunk.content, ct, source_id, chunk.line_start, chunk.line_end],
+                )?;
 
-            chunk_count += 1;
-            if chunk.is_code {
-                code_chunk_count += 1;
+                let rowid = self.conn.last_insert_rowid();
+
+                // Insert into trigram table
+                self.conn.execute(
+                    "INSERT INTO chunks_trigram (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![chunk.title, chunk.content, ct, source_id, chunk.line_start, chunk.line_end],
+                )?;
+
+                chunk_rowids.push(rowid);
+                embed_texts.push(format!("{} {}", chunk.title, chunk.content));
+
+                chunk_count += 1;
+                if chunk.is_code {
+                    code_chunk_count += 1;
+                }
             }
-        }
 
-        // Generate and store embeddings if embedder is available
-        if let Some(ref embedder) = self.embedder {
-            let text_refs: Vec<&str> = embed_texts.iter().map(|s| s.as_str()).collect();
-            match embedder.embed_batch(&text_refs) {
-                Ok(embeddings) => {
-                    let dim = embedder.dim() as i32;
-                    for (rowid, embedding) in chunk_rowids.iter().zip(embeddings.iter()) {
-                        let blob = embedder::embedding_to_bytes(embedding);
-                        self.conn.execute(
-                            "INSERT OR REPLACE INTO chunk_embeddings (chunk_rowid, embedding, dim) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![rowid, blob, dim],
-                        )?;
+            // Generate and store embeddings if embedder is available
+            if let Some(ref embedder) = self.embedder {
+                let text_refs: Vec<&str> = embed_texts.iter().map(|s| s.as_str()).collect();
+                match embedder.embed_batch(&text_refs) {
+                    Ok(embeddings) => {
+                        let dim = embedder.dim() as i32;
+                        for (rowid, embedding) in chunk_rowids.iter().zip(embeddings.iter()) {
+                            let blob = embedder::embedding_to_bytes(embedding);
+                            self.conn.execute(
+                                "INSERT OR REPLACE INTO chunk_embeddings (chunk_rowid, embedding, dim) VALUES (?1, ?2, ?3)",
+                                rusqlite::params![rowid, blob, dim],
+                            )?;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[bpcontext] embedding failed, skipping: {e}");
                     }
                 }
-                Err(e) => {
-                    eprintln!("[bpcontext] embedding failed, skipping: {e}");
-                }
+            }
+
+            self.conn.execute(
+                "UPDATE sources SET chunk_count = ?1, code_chunk_count = ?2 WHERE id = ?3",
+                rusqlite::params![chunk_count, code_chunk_count, source_id],
+            )?;
+
+            Ok(IndexResult {
+                source_id,
+                chunk_count,
+                code_chunk_count,
+            })
+        })();
+
+        match result {
+            Ok(index_result) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(index_result)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
             }
         }
-
-        self.conn.execute(
-            "UPDATE sources SET chunk_count = ?1, code_chunk_count = ?2 WHERE id = ?3",
-            rusqlite::params![chunk_count, code_chunk_count, source_id],
-        )?;
-
-        Ok(IndexResult {
-            source_id,
-            chunk_count,
-            code_chunk_count,
-        })
     }
 
     /// Search indexed content using the multi-layer search stack.
@@ -561,6 +577,46 @@ mod tests {
         assert!(chunks[0].rowid < chunks[1].rowid);
         assert!(chunks[0].content.contains("alpha line"));
         assert!(chunks[1].content.contains("beta line"));
+    }
+
+    #[test]
+    fn index_many_chunks_in_transaction() {
+        let store = test_store();
+
+        // Build content with 20 markdown sections, each with enough text to form a chunk
+        let content: String = (0..20)
+            .map(|i| {
+                format!(
+                    "## Section {i}\n\n\
+                     This is section number {i} with enough prose to be meaningful.\n\
+                     It covers topic {i} in detail with several sentences of content.\n\
+                     The purpose is to verify that all chunks are stored in a single transaction.\n\n"
+                )
+            })
+            .collect();
+
+        let result = store.index("many-sections", &content, None).unwrap();
+        assert!(
+            result.chunk_count >= 2,
+            "expected multiple chunks, got {}",
+            result.chunk_count
+        );
+
+        // All chunks should be retrievable
+        let chunks = store.get_chunks_by_source("many-sections").unwrap();
+        assert_eq!(chunks.len(), result.chunk_count as usize);
+
+        // All chunks should be searchable via FTS5
+        let hits = store.search("section", 50, None, None).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "expected search hits for 'section', got none"
+        );
+
+        // Source metadata should reflect the correct chunk count
+        let sources = store.find_sources_by_label("many-sections").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].chunk_count, result.chunk_count);
     }
 
     #[test]
