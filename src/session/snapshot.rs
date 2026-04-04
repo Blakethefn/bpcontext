@@ -36,7 +36,7 @@ pub fn build_resume_snapshot(conn: &Connection) -> Result<String> {
         max_b.cmp(&max_a)
     });
 
-    for (category, events) in sorted_cats {
+    for (cat_idx, (category, events)) in sorted_cats.iter().enumerate() {
         let section = format!(
             "### {category}\n- {} events (latest: {})\n\n",
             events.len(),
@@ -49,7 +49,7 @@ pub fn build_resume_snapshot(conn: &Connection) -> Result<String> {
         if current_bytes + section.len() > MAX_SNAPSHOT_BYTES {
             snapshot.push_str(&format!(
                 "... [{} more categories]\n",
-                categories.len() - snapshot.matches("###").count()
+                categories.len() - cat_idx
             ));
             break;
         }
