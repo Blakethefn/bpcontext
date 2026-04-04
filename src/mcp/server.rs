@@ -197,17 +197,18 @@ fn search_weights(config: &Config) -> crate::store::search::SearchWeights {
 }
 
 fn adaptive_content(
-    content: &str,
+    content: String,
     threshold: usize,
     preview_bytes: usize,
 ) -> (String, bool, usize) {
-    if content.len() <= threshold {
-        (content.to_string(), true, content.len())
+    let len = content.len();
+    if len <= threshold {
+        (content, true, len)
     } else {
         (
-            truncate::preview(content, preview_bytes),
+            truncate::preview(&content, preview_bytes),
             false,
-            content.len().min(preview_bytes),
+            len.min(preview_bytes),
         )
     }
 }
@@ -248,13 +249,14 @@ fn handle_execute(args: &Value, config: &Config, store: &ContentStore) -> Result
     let index_result = store.index(label, &full_output, None)?;
     stats::record_indexed(full_output.len() as u64);
 
+    let full_len = full_output.len();
     let (output_text, is_full, visible_bytes) =
-        adaptive_content(&full_output, config.general.preview_threshold_bytes, 3072);
+        adaptive_content(full_output, config.general.preview_threshold_bytes, 3072);
     stats::record_visible(visible_bytes as u64);
     stats::record_returned(output_text.len() as u64);
 
     let footer = if is_full {
-        format!("Full content returned ({} bytes).", full_output.len())
+        format!("Full content returned ({full_len} bytes).")
     } else {
         "Use bpx_search or bpx_read_chunks for specific sections.".to_string()
     };
@@ -494,7 +496,7 @@ fn handle_execute_file(args: &Value, config: &Config, store: &ContentStore) -> R
         }
     }
 
-    let (preview, _, visible_bytes) = adaptive_content(&content, 0, 3072);
+    let (preview, _, visible_bytes) = adaptive_content(content, 0, 3072);
     stats::record_visible(visible_bytes as u64);
     stats::record_returned(preview.len() as u64);
 
@@ -588,13 +590,14 @@ fn handle_fetch_and_index(args: &Value, config: &Config, store: &ContentStore) -
     let index_result = store.index(label, &content, Some("prose"))?;
     stats::record_indexed(content.len() as u64);
 
+    let content_len = content.len();
     let (output_text, is_full, visible_bytes) =
-        adaptive_content(&content, config.general.preview_threshold_bytes, 3072);
+        adaptive_content(content, config.general.preview_threshold_bytes, 3072);
     stats::record_visible(visible_bytes as u64);
     stats::record_returned(output_text.len() as u64);
 
     let footer = if is_full {
-        format!("Full content returned ({} bytes).", content.len())
+        format!("Full content returned ({content_len} bytes).")
     } else {
         "Use bpx_search or bpx_read_chunks for specific sections.".to_string()
     };
