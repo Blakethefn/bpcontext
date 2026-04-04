@@ -25,6 +25,7 @@ impl ContentStore {
         let db_path = db::content_db_path(project_dir)?;
         let conn = db::open_db(&db_path)?;
         schema::init_content_schema(&conn)?;
+        schema::migrate_add_line_columns(&conn)?;
         Ok(Self {
             conn,
             embedder: None,
@@ -38,6 +39,7 @@ impl ContentStore {
         let db_path = db::content_db_path(project_dir)?;
         let conn = db::open_db(&db_path)?;
         schema::init_content_schema(&conn)?;
+        schema::migrate_add_line_columns(&conn)?;
         Ok(Self {
             conn,
             embedder: Some(embedder),
@@ -64,7 +66,7 @@ impl ContentStore {
             self.embedder_warned.set(true);
             Some(
                 "[bpx: semantic search unavailable — model not downloaded. \
-                 Run `bpcontext embed-init` to download.]"
+                 bpcontext will fall back to keyword search until the model is available.]"
                     .to_string(),
             )
         } else {
@@ -99,16 +101,16 @@ impl ContentStore {
 
             // Insert into primary FTS5 table
             self.conn.execute(
-                "INSERT INTO chunks (title, content, content_type, source_id) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![chunk.title, chunk.content, ct, source_id],
+                "INSERT INTO chunks (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![chunk.title, chunk.content, ct, source_id, chunk.line_start, chunk.line_end],
             )?;
 
             let rowid = self.conn.last_insert_rowid();
 
             // Insert into trigram table
             self.conn.execute(
-                "INSERT INTO chunks_trigram (title, content, content_type, source_id) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![chunk.title, chunk.content, ct, source_id],
+                "INSERT INTO chunks_trigram (title, content, content_type, source_id, line_start, line_end) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![chunk.title, chunk.content, ct, source_id, chunk.line_start, chunk.line_end],
             )?;
 
             chunk_rowids.push(rowid);
@@ -185,6 +187,29 @@ impl ContentStore {
             query,
             limit,
             source_filter,
+            None,
+            type_filter,
+            embedder_ref,
+            weights,
+        )
+    }
+
+    /// Search within a single exact source ID.
+    pub fn search_exact_source_with_weights(
+        &self,
+        query: &str,
+        limit: u32,
+        source_id: i64,
+        type_filter: Option<&str>,
+        weights: &search::SearchWeights,
+    ) -> Result<Vec<search::SearchResult>> {
+        let embedder_ref = self.embedder.as_deref();
+        search::multi_layer_search(
+            &self.conn,
+            query,
+            limit,
+            None,
+            Some(source_id),
             type_filter,
             embedder_ref,
             weights,
@@ -214,7 +239,7 @@ impl ContentStore {
     /// Retrieve indexed chunks for a single source label in original order.
     pub fn get_chunks_by_source(&self, label: &str) -> Result<Vec<ChunkInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.rowid, c.title, c.content, c.content_type
+            "SELECT c.rowid, c.title, c.content, c.content_type, c.line_start, c.line_end
              FROM chunks c
              JOIN sources s ON c.source_id = s.id
              WHERE s.label = ?1
@@ -228,12 +253,65 @@ impl ContentStore {
                     title: row.get(1)?,
                     content: row.get(2)?,
                     content_type: row.get(3)?,
+                    line_start: row.get::<_, i64>(4).unwrap_or(0) as u32,
+                    line_end: row.get::<_, i64>(5).unwrap_or(0) as u32,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to load chunks by source")?;
 
         Ok(chunks)
+    }
+
+    /// Retrieve indexed chunks for a single exact source ID in original order.
+    pub fn get_chunks_by_source_id(&self, source_id: i64) -> Result<Vec<ChunkInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, title, content, content_type, line_start, line_end
+             FROM chunks
+             WHERE source_id = ?1
+             ORDER BY rowid",
+        )?;
+
+        let chunks = stmt
+            .query_map(rusqlite::params![source_id], |row| {
+                Ok(ChunkInfo {
+                    rowid: row.get(0)?,
+                    title: row.get(1)?,
+                    content: row.get(2)?,
+                    content_type: row.get(3)?,
+                    line_start: row.get::<_, i64>(4).unwrap_or(0) as u32,
+                    line_end: row.get::<_, i64>(5).unwrap_or(0) as u32,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to load chunks by source id")?;
+
+        Ok(chunks)
+    }
+
+    /// Find all sources whose label exactly matches the provided value.
+    pub fn find_sources_by_label(&self, label: &str) -> Result<Vec<SourceInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label, indexed_at, chunk_count, code_chunk_count
+             FROM sources
+             WHERE label = ?1
+             ORDER BY indexed_at DESC, id DESC",
+        )?;
+
+        let sources = stmt
+            .query_map(rusqlite::params![label], |row| {
+                Ok(SourceInfo {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    indexed_at: row.get(2)?,
+                    chunk_count: row.get(3)?,
+                    code_chunk_count: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to find sources by label")?;
+
+        Ok(sources)
     }
 
     /// Get total bytes indexed (approximate from chunk content)
@@ -278,6 +356,8 @@ pub struct ChunkInfo {
     pub title: String,
     pub content: String,
     pub content_type: String,
+    pub line_start: u32,
+    pub line_end: u32,
 }
 
 #[cfg(test)]
@@ -290,6 +370,7 @@ mod tests {
     fn test_store() -> ContentStore {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         schema::init_content_schema(&conn).unwrap();
+        schema::migrate_add_line_columns(&conn).unwrap();
         ContentStore {
             conn,
             embedder: None,
@@ -301,6 +382,7 @@ mod tests {
     fn test_store_with_embedder() -> ContentStore {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         schema::init_content_schema(&conn).unwrap();
+        schema::migrate_add_line_columns(&conn).unwrap();
         ContentStore {
             conn,
             embedder: Some(Arc::new(MockEmbedder::new())),
@@ -479,5 +561,17 @@ mod tests {
         assert!(chunks[0].rowid < chunks[1].rowid);
         assert!(chunks[0].content.contains("alpha line"));
         assert!(chunks[1].content.contains("beta line"));
+    }
+
+    #[test]
+    fn test_indexed_chunks_preserve_line_numbers() {
+        let store = test_store();
+        let content = "# Title\nLine two\n## Section\nLine four";
+        store.index("test.md", content, None).unwrap();
+        let chunks = store.get_chunks_by_source("test.md").unwrap();
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks[0].line_start, 1);
+        assert!(chunks[0].line_end > 0);
+        assert!(chunks[1].line_start > chunks[0].line_start);
     }
 }

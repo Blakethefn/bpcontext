@@ -19,6 +19,8 @@ pub fn init_content_schema(conn: &Connection) -> Result<()> {
              content,
              content_type,
              source_id UNINDEXED,
+             line_start UNINDEXED,
+             line_end UNINDEXED,
              tokenize = 'porter unicode61'
          );
 
@@ -28,6 +30,8 @@ pub fn init_content_schema(conn: &Connection) -> Result<()> {
              content,
              content_type,
              source_id UNINDEXED,
+             line_start UNINDEXED,
+             line_end UNINDEXED,
              tokenize = 'trigram'
          );
 
@@ -38,6 +42,50 @@ pub fn init_content_schema(conn: &Connection) -> Result<()> {
              dim INTEGER NOT NULL DEFAULT 384
          );",
     )?;
+    Ok(())
+}
+
+/// Migrate existing FTS5 tables to include line_start and line_end columns.
+///
+/// FTS5 virtual tables cannot be ALTERed, so we drop and recreate them when
+/// the new columns are absent. Existing indexed data is lost and will be
+/// re-indexed on next use — this is acceptable for a search cache.
+pub fn migrate_add_line_columns(conn: &Connection) -> Result<()> {
+    // Probe for the new column. If this succeeds, migration is already done.
+    let already_migrated = conn
+        .execute_batch("SELECT line_start FROM chunks LIMIT 0")
+        .is_ok();
+
+    if already_migrated {
+        return Ok(());
+    }
+
+    // Drop and recreate both FTS5 tables with the new columns.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS chunks;
+         DROP TABLE IF EXISTS chunks_trigram;
+
+         CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+             title,
+             content,
+             content_type,
+             source_id UNINDEXED,
+             line_start UNINDEXED,
+             line_end UNINDEXED,
+             tokenize = 'porter unicode61'
+         );
+
+         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_trigram USING fts5(
+             title,
+             content,
+             content_type,
+             source_id UNINDEXED,
+             line_start UNINDEXED,
+             line_end UNINDEXED,
+             tokenize = 'trigram'
+         );",
+    )?;
+
     Ok(())
 }
 
