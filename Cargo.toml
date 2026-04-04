@@ -33,7 +33,6 @@ dirs = "6"
 anyhow = "1"
 chrono = "0.4"
 colored = "3"
-regex = "1"
 sha2 = "0.10"
 
 # Fuzzy matching
@@ -43,7 +42,7 @@ strsim = "0.11"
 ignore = "0.4"
 
 # HTTP fetch
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+ureq = "3"
 htmd = "0.1"
 
 # Embeddings (Candle ML)
