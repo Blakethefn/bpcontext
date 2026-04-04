@@ -84,9 +84,20 @@ pub fn multi_layer_search(
     }
 
     // Layer 4: Vector similarity (always runs if embedder available)
+    // Pre-filter: only load embeddings for chunks that appeared in keyword layers
     if let Some(emb) = embedder {
         match emb.embed_one(query) {
             Ok(query_embedding) => {
+                let candidate_rowids: Vec<i64> = all_results
+                    .values()
+                    .filter_map(|sr| sr.rowid)
+                    .collect();
+                let candidates = if candidate_rowids.is_empty() {
+                    None // No keyword results — fall back to full search
+                } else {
+                    Some(candidate_rowids.as_slice())
+                };
+
                 let vector_results = vector_search(
                     conn,
                     &query_embedding,
@@ -94,6 +105,7 @@ pub fn multi_layer_search(
                     source_filter,
                     source_id_filter,
                     type_filter,
+                    candidates,
                 )?;
                 merge_results(&mut all_results, &vector_results, weights.vector_weight);
             }
@@ -143,7 +155,7 @@ fn fts5_bm25_search(
     let mut sql = String::from(
         "SELECT chunks.title, chunks.content, chunks.content_type, chunks.source_id,
                 bm25(chunks) as rank, COALESCE(s.label, '') as source_label,
-                chunks.line_start, chunks.line_end
+                chunks.line_start, chunks.line_end, chunks.rowid
          FROM chunks
          LEFT JOIN sources s ON chunks.source_id = s.id
          WHERE chunks MATCH ?1",
@@ -178,6 +190,7 @@ fn fts5_bm25_search(
                 source_label: row.get(5)?,
                 line_start: row.get::<_, i64>(6).unwrap_or(0) as u32,
                 line_end: row.get::<_, i64>(7).unwrap_or(0) as u32,
+                rowid: row.get::<_, i64>(8).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -212,7 +225,7 @@ fn trigram_search(
         "SELECT chunks_trigram.title, chunks_trigram.content, chunks_trigram.content_type,
                 chunks_trigram.source_id, bm25(chunks_trigram) as rank,
                 COALESCE(s.label, '') as source_label,
-                chunks_trigram.line_start, chunks_trigram.line_end
+                chunks_trigram.line_start, chunks_trigram.line_end, chunks_trigram.rowid
          FROM chunks_trigram
          LEFT JOIN sources s ON chunks_trigram.source_id = s.id
          WHERE chunks_trigram MATCH ?1",
@@ -250,6 +263,7 @@ fn trigram_search(
                 source_label: row.get(5)?,
                 line_start: row.get::<_, i64>(6).unwrap_or(0) as u32,
                 line_end: row.get::<_, i64>(7).unwrap_or(0) as u32,
+                rowid: row.get::<_, i64>(8).ok(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -347,6 +361,7 @@ fn vector_search(
     source_filter: Option<&str>,
     source_id_filter: Option<i64>,
     type_filter: Option<&str>,
+    candidate_rowids: Option<&[i64]>,
 ) -> Result<Vec<RankedResult>> {
     // Build query to load embeddings with chunk metadata
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -361,6 +376,24 @@ fn vector_search(
          LEFT JOIN sources s ON c.source_id = s.id
          WHERE 1=1",
     );
+
+    // Pre-filter to candidate rowids from keyword layers when available
+    if let Some(rowids) = candidate_rowids {
+        if !rowids.is_empty() {
+            let placeholders: Vec<String> = rowids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", params.len() + i + 1))
+                .collect();
+            sql.push_str(&format!(
+                " AND ce.chunk_rowid IN ({})",
+                placeholders.join(",")
+            ));
+            for &rid in rowids {
+                params.push(Box::new(rid));
+            }
+        }
+    }
 
     if let Some(tf) = type_filter {
         sql.push_str(&format!(" AND c.content_type = ?{}", params.len() + 1));
@@ -379,6 +412,7 @@ fn vector_search(
     let mut stmt = conn.prepare(&sql)?;
     let mut scored: Vec<(f32, RankedResult)> = stmt
         .query_map(param_refs.as_slice(), |row| {
+            let chunk_rowid: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
             Ok((
                 blob,
@@ -391,6 +425,7 @@ fn vector_search(
                     source_label: row.get(6)?,
                     line_start: row.get::<_, i64>(7).unwrap_or(0) as u32,
                     line_end: row.get::<_, i64>(8).unwrap_or(0) as u32,
+                    rowid: Some(chunk_rowid),
                 },
             ))
         })?
@@ -432,7 +467,13 @@ fn merge_results(acc: &mut HashMap<String, ScoredResult>, results: &[RankedResul
         let key = format!("{}:{}", result.source_id, result.title);
 
         acc.entry(key)
-            .and_modify(|sr| sr.rrf_score += rrf_score)
+            .and_modify(|sr| {
+                sr.rrf_score += rrf_score;
+                // Keep the first non-None rowid we see
+                if sr.rowid.is_none() {
+                    sr.rowid = result.rowid;
+                }
+            })
             .or_insert_with(|| ScoredResult {
                 title: result.title.clone(),
                 content: result.content.clone(),
@@ -442,6 +483,7 @@ fn merge_results(acc: &mut HashMap<String, ScoredResult>, results: &[RankedResul
                 rrf_score,
                 line_start: result.line_start,
                 line_end: result.line_end,
+                rowid: result.rowid,
             });
     }
 }
@@ -518,6 +560,7 @@ struct RankedResult {
     source_label: String,
     line_start: u32,
     line_end: u32,
+    rowid: Option<i64>,
 }
 
 struct ScoredResult {
@@ -529,6 +572,7 @@ struct ScoredResult {
     rrf_score: f64,
     line_start: u32,
     line_end: u32,
+    rowid: Option<i64>,
 }
 
 impl ScoredResult {
@@ -610,6 +654,7 @@ mod tests {
             source_label: "src".to_string(),
             line_start: 0,
             line_end: 0,
+            rowid: None,
         }];
 
         // Weight 1.0: rank 0 → 1/(60+0+1) = 0.01639...
@@ -698,7 +743,7 @@ mod tests {
         let conn = setup_vector_test_db();
         let query_emb = test_embedding("authentication login JWT");
 
-        let results = vector_search(&conn, &query_emb, 10, None, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
         assert!(!results.is_empty(), "vector search should return results");
         assert!(results.len() <= 3, "should not exceed chunk count");
     }
@@ -710,7 +755,7 @@ mod tests {
         let query_emb =
             test_embedding("authentication login flow with JWT tokens and session management");
 
-        let results = vector_search(&conn, &query_emb, 10, None, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
         assert!(!results.is_empty());
         // First result should be the "authentication" chunk (most similar)
         assert_eq!(results[0].title, "authentication");
@@ -721,7 +766,7 @@ mod tests {
         let conn = setup_vector_test_db();
         let query_emb = test_embedding("anything");
 
-        let results = vector_search(&conn, &query_emb, 1, None, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 1, None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -732,12 +777,12 @@ mod tests {
 
         // Filter by existing source
         let results =
-            vector_search(&conn, &query_emb, 10, Some("test-source"), None, None).unwrap();
+            vector_search(&conn, &query_emb, 10, Some("test-source"), None, None, None).unwrap();
         assert!(!results.is_empty());
 
         // Filter by non-existing source
         let results =
-            vector_search(&conn, &query_emb, 10, Some("nonexistent"), None, None).unwrap();
+            vector_search(&conn, &query_emb, 10, Some("nonexistent"), None, None, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -747,11 +792,11 @@ mod tests {
         let query_emb = test_embedding("anything");
 
         // Filter by existing type
-        let results = vector_search(&conn, &query_emb, 10, None, None, Some("prose")).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, Some("prose"), None).unwrap();
         assert!(!results.is_empty());
 
         // Filter by non-existing type
-        let results = vector_search(&conn, &query_emb, 10, None, None, Some("code")).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, Some("code"), None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -761,7 +806,7 @@ mod tests {
         super::super::schema::init_content_schema(&conn).unwrap();
 
         let query_emb = vec![0.1f32; 16];
-        let results = vector_search(&conn, &query_emb, 10, None, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -834,6 +879,7 @@ mod tests {
             Some("it's a test"),
             None,
             Some("100%done"),
+            None,
         );
         assert!(results.is_ok(), "special chars in vector_search filters should not error");
         assert!(results.unwrap().is_empty());
@@ -908,5 +954,58 @@ mod tests {
         let result = &results[0];
         assert_eq!(result.line_start, 10, "line_start should be 10");
         assert_eq!(result.line_end, 25, "line_end should be 25");
+    }
+
+    #[test]
+    fn test_vector_search_with_candidate_filter() {
+        let conn = setup_vector_test_db();
+        let query_emb = test_embedding("authentication login JWT");
+
+        // Get all chunk rowids to pick specific ones
+        let all_results =
+            vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
+        assert_eq!(all_results.len(), 3, "should have 3 chunks total");
+
+        // Extract rowid of just the first result
+        let first_rowid = all_results[0].rowid.expect("vector_search should set rowid");
+        let candidate_rowids = vec![first_rowid];
+
+        let filtered_results = vector_search(
+            &conn,
+            &query_emb,
+            10,
+            None,
+            None,
+            None,
+            Some(&candidate_rowids),
+        )
+        .unwrap();
+        assert_eq!(
+            filtered_results.len(),
+            1,
+            "should only return the one candidate chunk"
+        );
+        assert_eq!(filtered_results[0].title, all_results[0].title);
+    }
+
+    #[test]
+    fn test_vector_search_no_candidates_searches_all() {
+        let conn = setup_vector_test_db();
+        let query_emb = test_embedding("anything");
+
+        // None means no pre-filter — should return all chunks
+        let results =
+            vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
+        assert_eq!(results.len(), 3, "None candidates should search all chunks");
+
+        // Empty slice should also search all (no IN clause added)
+        let empty: Vec<i64> = vec![];
+        let results_empty =
+            vector_search(&conn, &query_emb, 10, None, None, None, Some(&empty)).unwrap();
+        assert_eq!(
+            results_empty.len(),
+            3,
+            "empty candidate slice should search all chunks"
+        );
     }
 }
