@@ -14,6 +14,8 @@ pub struct Config {
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
     pub context: ContextConfig,
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,6 +165,49 @@ impl Default for ContextConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KnowledgeConfig {
+    #[serde(default = "default_knowledge_enabled")]
+    pub enabled: bool,
+    /// Override the default knowledge DB location.
+    #[serde(default)]
+    pub db_path: Option<String>,
+    /// Minutes before a source is considered stale and re-synced (default 60).
+    #[serde(default = "default_sync_stale_minutes")]
+    pub sync_stale_minutes: u64,
+    /// Sources defined in config (synced automatically on first knowledge tool call).
+    #[serde(default)]
+    pub sources: Vec<KnowledgeSourceConfig>,
+}
+
+fn default_knowledge_enabled() -> bool {
+    true
+}
+
+fn default_sync_stale_minutes() -> u64 {
+    60
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            db_path: None,
+            sync_stale_minutes: 60,
+            sources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeSourceConfig {
+    pub label: String,
+    pub path: String,
+    pub glob: Option<String>,
+    #[serde(default)]
+    pub enrichments: Vec<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -193,6 +238,7 @@ impl Default for Config {
             cleanup: CleanupConfig { stale_db_days: 14 },
             embeddings: EmbeddingsConfig::default(),
             context: ContextConfig::default(),
+            knowledge: KnowledgeConfig::default(),
         }
     }
 }

@@ -7,6 +7,7 @@ mod executor;
 mod fetch;
 mod hooks;
 mod indexdir;
+mod knowledge;
 mod mcp;
 mod promote;
 mod session;

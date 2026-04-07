@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Base directory for all bpcontext data
-fn data_dir() -> Result<PathBuf> {
+pub(crate) fn data_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
         .context("Could not find local data directory")?
         .join("bpcontext");
