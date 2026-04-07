@@ -257,6 +257,8 @@ mod tests {
         stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
+        // Suppress visibility alert — global stats are shared across parallel tests
+        mgr.visibility_alert_fired = true;
 
         ledger::record_return(&conn, 1, "src", 400).unwrap();
 
@@ -272,8 +274,6 @@ mod tests {
         stats::reset();
         let conn = test_conn();
         let mut mgr = test_mgr(1000);
-        // Suppress visibility alert — global stats are shared across parallel tests
-        mgr.visibility_alert_fired = true;
 
         ledger::record_return(&conn, 1, "src", 400).unwrap();
 

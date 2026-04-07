@@ -211,7 +211,6 @@ impl ContentStore {
     }
 
     /// Search within a single exact source ID.
-    #[allow(dead_code)]
     pub fn search_exact_source_with_weights(
         &self,
         query: &str,
@@ -281,7 +280,6 @@ impl ContentStore {
     }
 
     /// Retrieve indexed chunks for a single exact source ID in original order.
-    #[allow(dead_code)]
     pub fn get_chunks_by_source_id(&self, source_id: i64) -> Result<Vec<ChunkInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT rowid, title, content, content_type, line_start, line_end
@@ -308,7 +306,6 @@ impl ContentStore {
     }
 
     /// Find all sources whose label exactly matches the provided value.
-    #[allow(dead_code)]
     pub fn find_sources_by_label(&self, label: &str) -> Result<Vec<SourceInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, label, indexed_at, chunk_count, code_chunk_count

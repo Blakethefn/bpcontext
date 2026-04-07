@@ -411,7 +411,7 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
         && queries.len() == 1
         && queries[0]
             .as_str()
-            .is_some_and(|q| q.split_whitespace().count() <= 2);
+            .map_or(false, |q| q.split_whitespace().count() <= 2);
 
     if is_broad {
         output.push_str(
