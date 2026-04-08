@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod db;
+pub mod enrichment;
 pub mod sync;
 
 use anyhow::{anyhow, Result};
