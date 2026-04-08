@@ -59,7 +59,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "bpx_search",
-                "description": "Primary retrieval tool after indexing. Search indexed content using multi-layer search and use the returned source_id for exact follow-up reads via bpx_read_chunks. REVIEW RULE: bpx_search is for discovery, not for repo-wide claims. Before stating 'no endpoint checks X' or 'all routes do Y', you MUST confirm with exact reads (Read tool or bpx_read_chunks) on the specific files. Search results show where matches exist — absence from results does NOT prove absence from the codebase.",
+                "description": "Primary retrieval tool after indexing. Search indexed content using multi-layer search and use the returned source_id for exact follow-up reads via bpx_read_chunks. When knowledge sources are registered, also searches persistent knowledge index and merges results. REVIEW RULE: bpx_search is for discovery, not for repo-wide claims. Before stating 'no endpoint checks X' or 'all routes do Y', you MUST confirm with exact reads (Read tool or bpx_read_chunks) on the specific files. Search results show where matches exist — absence from results does NOT prove absence from the codebase.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -84,6 +84,14 @@ pub fn tool_definitions() -> Value {
                         "snippet_bytes": {
                             "type": "integer",
                             "description": "Max bytes per snippet for top results (default: 2000)"
+                        },
+                        "include_knowledge": {
+                            "type": "boolean",
+                            "description": "Include results from persistent knowledge sources (default: true)"
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Metadata filter for knowledge results (e.g., 'type:task status:active')"
                         }
                     },
                     "required": ["queries"]
@@ -247,6 +255,69 @@ pub fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {},
                     "required": []
+                }
+            },
+            {
+                "name": "bpx_knowledge_add",
+                "description": "Register a directory as a persistent knowledge source and run the initial sync. The knowledge index persists across sessions — files are indexed once and updated incrementally on changes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the directory to index"
+                        },
+                        "label": {
+                            "type": "string",
+                            "description": "Unique label for this source (e.g., 'vault', 'docs')"
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "File pattern filter (e.g., '**/*.md'). Default: all text files"
+                        },
+                        "enrichments": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Metadata enrichments to enable: 'frontmatter', 'wikilinks', 'folder_tags'"
+                        }
+                    },
+                    "required": ["path", "label"]
+                }
+            },
+            {
+                "name": "bpx_knowledge_sync",
+                "description": "Re-sync knowledge sources. Only re-indexes changed files (incremental). Run after bulk changes like git pulls.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": "Sync a specific source. If omitted, sync all sources."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "bpx_knowledge_status",
+                "description": "Show registered knowledge sources, sync state, and index statistics.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "bpx_knowledge_remove",
+                "description": "Unregister a knowledge source and delete all its indexed content.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "label": {
+                            "type": "string",
+                            "description": "Source label to remove"
+                        }
+                    },
+                    "required": ["label"]
                 }
             }
         ]

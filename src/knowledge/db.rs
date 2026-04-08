@@ -4,9 +4,6 @@
 //! `~/.local/share/bpcontext/knowledge.db`. It is separate from the per-project
 //! session and content databases.
 
-// Foundation module — consumed by later implementation prompts (P02-P06).
-#![allow(dead_code)]
-
 use anyhow::Result;
 use rusqlite::Connection;
 use std::path::PathBuf;

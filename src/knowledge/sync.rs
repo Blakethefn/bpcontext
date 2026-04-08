@@ -4,9 +4,6 @@
 //! against the database, and re-indexes only changed files. Provides
 //! `reindex_file()` for single-file updates used by the write-through hook (P05).
 
-// Foundation module — public items consumed by later prompts (P05, P06).
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;

@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueHint};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -107,5 +107,57 @@ pub enum Commands {
         /// Prefix for all labels (e.g. "myproject/")
         #[arg(short, long, default_value = "")]
         label_prefix: String,
+    },
+
+    /// Manage persistent knowledge sources
+    Knowledge {
+        #[command(subcommand)]
+        action: KnowledgeAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KnowledgeAction {
+    /// Register a directory as a knowledge source and sync
+    Add {
+        /// Absolute path to the directory
+        #[arg(value_hint = ValueHint::DirPath)]
+        path: PathBuf,
+        /// Unique label for this source
+        #[arg(long)]
+        label: String,
+        /// File pattern filter (e.g., "**/*.md")
+        #[arg(long)]
+        glob: Option<String>,
+        /// Enrichments to enable (comma-separated: frontmatter,wikilinks,folder_tags)
+        #[arg(long, value_delimiter = ',')]
+        enrichments: Vec<String>,
+    },
+    /// Re-sync knowledge sources (incremental)
+    Sync {
+        /// Sync a specific source (default: all)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Search knowledge index
+    Search {
+        /// Search query
+        query: String,
+        /// Metadata filter (e.g., "type:task status:active")
+        #[arg(long)]
+        filter: Option<String>,
+        /// Restrict to a specific source
+        #[arg(long)]
+        source: Option<String>,
+        /// Max results
+        #[arg(long, default_value = "10")]
+        limit: u32,
+    },
+    /// Show knowledge source status
+    Status,
+    /// Remove a knowledge source
+    Remove {
+        /// Source label to remove
+        label: String,
     },
 }

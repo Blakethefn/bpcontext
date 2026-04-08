@@ -1,7 +1,8 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{self, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::tools;
@@ -9,10 +10,11 @@ use super::transport;
 use crate::config::Config;
 use crate::context::advisor::RelevanceWeights;
 use crate::context::ContextManager;
-use crate::embedder::Embedder;
+use crate::embedder::{Embed, Embedder};
 use crate::executor;
 use crate::fetch;
 use crate::indexdir;
+use crate::knowledge::{self, enrichment, sync, KnowledgeStore};
 use crate::promote;
 use crate::session::SessionStore;
 use crate::stats;
@@ -24,19 +26,54 @@ pub fn run(project_dir: &Path) -> Result<()> {
     let config = Config::load()?;
     let mut store = ContentStore::open(project_dir)?;
 
-    // Lazy embedder initialization
-    if config.embeddings.enabled {
+    // Shared embedder — used by both session and knowledge stores
+    let shared_embedder: Option<Arc<dyn Embed>> = if config.embeddings.enabled {
         let model_dir =
-            std::path::PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
+            PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
         match Embedder::new(&model_dir) {
             Ok(embedder) => {
-                store.set_embedder(std::sync::Arc::new(embedder));
+                let arc: Arc<dyn Embed> = Arc::new(embedder);
+                store.set_embedder(Arc::clone(&arc));
+                Some(arc)
             }
             Err(e) => {
                 eprintln!("[bpcontext] embedder unavailable, falling back to keyword search: {e}");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
+
+    // Knowledge store (persistent, cross-session)
+    let knowledge_store: Option<KnowledgeStore> = if config.knowledge.enabled {
+        match KnowledgeStore::open() {
+            Ok(mut ks) => {
+                if let Some(ref emb) = shared_embedder {
+                    ks.set_embedder(Arc::clone(emb));
+                }
+                // Register config-defined sources idempotently
+                for src_cfg in &config.knowledge.sources {
+                    if ks.get_source(&src_cfg.label).unwrap_or(None).is_none() {
+                        let _ = ks.add_source(
+                            &src_cfg.label,
+                            &src_cfg.path,
+                            src_cfg.glob.as_deref(),
+                            &src_cfg.enrichments,
+                        );
+                    }
+                }
+                Some(ks)
+            }
+            Err(e) => {
+                eprintln!("[bpcontext] knowledge store unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut knowledge_synced = false;
 
     // Session store + context manager (reset per conversation)
     let session_store = SessionStore::open(project_dir)?;
@@ -94,6 +131,17 @@ pub fn run(project_dir: &Path) -> Result<()> {
             "tools/call" => {
                 let tool_name = request["params"]["name"].as_str().unwrap_or("");
                 let arguments = &request["params"]["arguments"];
+
+                // Auto-sync knowledge on first search call
+                if !knowledge_synced {
+                    if let Some(ref ks) = knowledge_store {
+                        if tool_name == "bpx_search" || tool_name == "bpx_knowledge_search" {
+                            let _ = auto_sync_knowledge(ks, &config);
+                            knowledge_synced = true;
+                        }
+                    }
+                }
+
                 let result = handle_tool_call(
                     tool_name,
                     arguments,
@@ -101,6 +149,7 @@ pub fn run(project_dir: &Path) -> Result<()> {
                     &store,
                     project_dir,
                     &session_store,
+                    knowledge_store.as_ref(),
                 );
 
                 match result {
@@ -171,11 +220,12 @@ fn handle_tool_call(
     store: &ContentStore,
     project_dir: &Path,
     session_store: &SessionStore,
+    knowledge_store: Option<&KnowledgeStore>,
 ) -> Result<String> {
     match tool_name {
         "bpx_execute" => handle_execute(args, config, store),
         "bpx_batch_execute" => handle_batch_execute(args, config, store),
-        "bpx_search" => handle_search(args, config, store),
+        "bpx_search" => handle_search(args, config, store, knowledge_store),
         "bpx_execute_file" => handle_execute_file(args, config, store),
         "bpx_read_chunks" => handle_read_chunks(args, config, store),
         "bpx_fetch_and_index" => handle_fetch_and_index(args, config, store),
@@ -185,6 +235,31 @@ fn handle_tool_call(
         "bpx_stats" => handle_stats(config, store, project_dir, session_store),
         "bpx_sources" => handle_sources(store),
         "bpx_context_status" => handle_context_status(config, session_store),
+        "bpx_knowledge_add" => {
+            let ks = knowledge_store
+                .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
+            handle_knowledge_add(args, ks, config)
+        }
+        "bpx_knowledge_sync" => {
+            let ks = knowledge_store
+                .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
+            handle_knowledge_sync(args, ks)
+        }
+        "bpx_knowledge_search" => {
+            let ks = knowledge_store
+                .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
+            handle_knowledge_search(args, ks, config)
+        }
+        "bpx_knowledge_status" => {
+            let ks = knowledge_store
+                .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
+            handle_knowledge_status(ks)
+        }
+        "bpx_knowledge_remove" => {
+            let ks = knowledge_store
+                .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
+            handle_knowledge_remove(args, ks)
+        }
         _ => anyhow::bail!("Unknown tool: {tool_name}"),
     }
 }
@@ -348,7 +423,12 @@ fn handle_batch_execute(args: &Value, config: &Config, store: &ContentStore) -> 
     Ok(output)
 }
 
-fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<String> {
+fn handle_search(
+    args: &Value,
+    config: &Config,
+    store: &ContentStore,
+    knowledge_store: Option<&KnowledgeStore>,
+) -> Result<String> {
     let queries = args["queries"].as_array().unwrap_or(&Vec::new()).clone();
     let source = args["source"].as_str();
     let content_type = args["content_type"].as_str();
@@ -358,8 +438,16 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
     let top_snippet_bytes = args["snippet_bytes"]
         .as_u64()
         .unwrap_or(config.search.snippet_bytes as u64) as usize;
+    let include_knowledge = args["include_knowledge"].as_bool().unwrap_or(true);
+    let knowledge_filter = args["filter"].as_str();
 
     let weights = search_weights(config);
+
+    // Check if knowledge results should be merged
+    let use_knowledge = include_knowledge
+        && knowledge_store
+            .map(|ks| !ks.list_sources().unwrap_or_default().is_empty())
+            .unwrap_or(false);
 
     let mut output = String::new();
     let mut visible_bytes = 0u64;
@@ -371,13 +459,35 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
         }
 
         stats::record_search();
+
+        // Session-only search
         let results = store.search_with_weights(query, limit, source, content_type, &weights)?;
 
+        // Knowledge search (merged via combined_search)
+        let knowledge_results = if use_knowledge {
+            let ks = knowledge_store.unwrap();
+            knowledge::search::knowledge_search(
+                ks,
+                query,
+                knowledge_filter,
+                None,
+                limit,
+                &weights,
+                top_snippet_bytes,
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         output.push_str(&format!("### \"{query}\"\n"));
-        if results.is_empty() {
+
+        if results.is_empty() && knowledge_results.is_empty() {
             output.push_str("No results.\n\n");
         } else {
             let mut truncated_any = false;
+
+            // Session results
             for (i, result) in results.iter().enumerate() {
                 let max_bytes = if i < config.search.top_result_count {
                     top_snippet_bytes
@@ -398,6 +508,27 @@ fn handle_search(args: &Value, config: &Config, store: &ContentStore) -> Result<
                     result.title, result.source, result.source_id, result.content_type, result.score
                 ));
             }
+
+            // Knowledge results
+            if !knowledge_results.is_empty() {
+                output.push_str("#### Knowledge results\n");
+                for (i, kr) in knowledge_results.iter().enumerate() {
+                    let max_bytes = if i < config.search.top_result_count {
+                        top_snippet_bytes
+                    } else {
+                        config.search.secondary_snippet_bytes
+                    };
+                    let (snippet, truncated, snippet_visible) =
+                        preview_snippet(&kr.snippet, max_bytes);
+                    truncated_any |= truncated;
+                    visible_bytes += snippet_visible as u64;
+                    output.push_str(&format!(
+                        "**[{}]** (source: {}, type: knowledge, file: {}, score: {:.4})\n{snippet}\n\n",
+                        kr.title, kr.source_label, kr.file_path, kr.score
+                    ));
+                }
+            }
+
             if truncated_any {
                 output.push_str(
                     "Some results were truncated. Use bpx_read_chunks with the source label to see full content.\n\n"
@@ -838,6 +969,196 @@ fn handle_context_status(config: &Config, session_store: &SessionStore) -> Resul
     Ok(output)
 }
 
+// ── Knowledge store handlers ────────────────────────────────────────────────
+
+/// Build an enrichment function for a source and call sync.
+fn sync_source_with_enrichment(
+    ks: &KnowledgeStore,
+    source: &knowledge::KnowledgeSourceInfo,
+) -> Result<sync::SyncResult> {
+    let base = Path::new(&source.path);
+    let enrichment_fn = enrichment::build_enrichment_fn(&source.enrichments, base);
+    let enrich_ref = enrichment_fn
+        .as_ref()
+        .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+    sync::sync_source(ks, source, enrich_ref)
+}
+
+/// Check if a source is stale based on its last_sync timestamp.
+fn is_source_stale(source: &knowledge::KnowledgeSourceInfo, stale_minutes: u64) -> bool {
+    match &source.last_sync {
+        None => true,
+        Some(ts) => {
+            use chrono::NaiveDateTime;
+            match NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S") {
+                Ok(last) => {
+                    let now = chrono::Utc::now().naive_utc();
+                    let elapsed = now.signed_duration_since(last);
+                    elapsed.num_minutes() as u64 >= stale_minutes
+                }
+                Err(_) => true,
+            }
+        }
+    }
+}
+
+/// Auto-sync stale knowledge sources on first search in a session.
+fn auto_sync_knowledge(ks: &KnowledgeStore, config: &Config) -> Result<()> {
+    let sources = ks.list_sources()?;
+    for source in &sources {
+        if is_source_stale(source, config.knowledge.sync_stale_minutes) {
+            let _ = sync_source_with_enrichment(ks, source);
+        }
+    }
+    Ok(())
+}
+
+fn handle_knowledge_add(args: &Value, ks: &KnowledgeStore, config: &Config) -> Result<String> {
+    let path = args["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("path is required"))?;
+    let label = args["label"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("label is required"))?;
+    let glob = args["glob"].as_str();
+    let enrichments: Vec<String> = args["enrichments"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let path_buf = PathBuf::from(path);
+    if !path_buf.is_dir() {
+        anyhow::bail!("Path does not exist or is not a directory: {path}");
+    }
+
+    ks.add_source(label, path, glob, &enrichments)?;
+    let source = ks
+        .get_source(label)?
+        .ok_or_else(|| anyhow::anyhow!("Failed to retrieve newly added source"))?;
+    let result = sync_source_with_enrichment(ks, &source)?;
+
+    let _ = config; // config available for future use
+    Ok(format!(
+        "Knowledge source '{}' registered and synced.\n\
+         Files indexed: {}\nChunks created: {}\nDuration: {}ms",
+        label, result.files_added, result.chunks_total, result.duration_ms
+    ))
+}
+
+fn handle_knowledge_sync(args: &Value, ks: &KnowledgeStore) -> Result<String> {
+    let label = args["label"].as_str();
+
+    let results = if let Some(label) = label {
+        let source = ks
+            .get_source(label)?
+            .ok_or_else(|| anyhow::anyhow!("Knowledge source '{}' not found", label))?;
+        vec![sync_source_with_enrichment(ks, &source)?]
+    } else {
+        // Sync all sources with per-source enrichment functions
+        let sources = ks.list_sources()?;
+        let mut results = Vec::with_capacity(sources.len());
+        for source in &sources {
+            results.push(sync_source_with_enrichment(ks, source)?);
+        }
+        results
+    };
+
+    let mut output = String::new();
+    for r in &results {
+        output.push_str(&format!(
+            "Source '{}': +{} added, ~{} updated, -{} removed, ={} unchanged ({} chunks, {}ms)\n",
+            r.source_label,
+            r.files_added,
+            r.files_updated,
+            r.files_removed,
+            r.files_unchanged,
+            r.chunks_total,
+            r.duration_ms
+        ));
+    }
+    if output.is_empty() {
+        output = "No knowledge sources registered.".to_string();
+    }
+    Ok(output)
+}
+
+fn handle_knowledge_search(args: &Value, ks: &KnowledgeStore, config: &Config) -> Result<String> {
+    let query = args["query"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("query is required"))?;
+    let filter = args["filter"].as_str();
+    let source = args["source"].as_str();
+    let limit = args["limit"].as_u64().unwrap_or(10) as u32;
+    let snippet_bytes = args["snippet_bytes"]
+        .as_u64()
+        .unwrap_or(config.search.snippet_bytes as u64) as usize;
+
+    let weights = search_weights(config);
+
+    let results =
+        knowledge::search::knowledge_search(ks, query, filter, source, limit, &weights, snippet_bytes)?;
+
+    let mut output = String::new();
+    for (i, r) in results.iter().enumerate() {
+        output.push_str(&format!(
+            "{}. [{}] {} (score: {:.3})\n   File: {} (lines {})\n   {}\n\n",
+            i + 1,
+            r.source_label,
+            r.title,
+            r.score,
+            r.file_path,
+            r.lines,
+            truncate::preview(&r.snippet, 200)
+        ));
+    }
+    if output.is_empty() {
+        output = "No results found.".to_string();
+    }
+    Ok(output)
+}
+
+fn handle_knowledge_status(ks: &KnowledgeStore) -> Result<String> {
+    let sources = ks.list_sources()?;
+
+    if sources.is_empty() {
+        return Ok("No knowledge sources registered.".to_string());
+    }
+
+    let mut output = String::from("Knowledge Sources:\n\n");
+    for s in &sources {
+        output.push_str(&format!(
+            "  {} — {}\n    Glob: {}\n    Enrichments: {}\n    Files: {} | Chunks: {}\n    Last sync: {}\n\n",
+            s.label,
+            s.path,
+            s.glob.as_deref().unwrap_or("all files"),
+            if s.enrichments.is_empty() {
+                "none".to_string()
+            } else {
+                s.enrichments.join(", ")
+            },
+            s.file_count,
+            s.chunk_count,
+            s.last_sync.as_deref().unwrap_or("never"),
+        ));
+    }
+    Ok(output)
+}
+
+fn handle_knowledge_remove(args: &Value, ks: &KnowledgeStore) -> Result<String> {
+    let label = args["label"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("label is required"))?;
+    let result = ks.remove_source(label)?;
+    Ok(format!(
+        "Removed knowledge source '{}'. Deleted {} files, {} chunks.",
+        label, result.files_removed, result.chunks_removed
+    ))
+}
+
 /// Extract a human-readable label from a tool call for the context ledger.
 fn tool_label(tool_name: &str, args: &Value) -> String {
     match tool_name {
@@ -865,6 +1186,17 @@ fn tool_label(tool_name: &str, args: &Value) -> String {
         "bpx_stats" => "stats".to_string(),
         "bpx_sources" => "sources".to_string(),
         "bpx_context_status" => "context-status".to_string(),
+        "bpx_knowledge_add" => args["label"].as_str().unwrap_or("knowledge-add").to_string(),
+        "bpx_knowledge_sync" => args["label"]
+            .as_str()
+            .map(|l| format!("knowledge-sync:{l}"))
+            .unwrap_or_else(|| "knowledge-sync".to_string()),
+        "bpx_knowledge_search" => "knowledge-search".to_string(),
+        "bpx_knowledge_status" => "knowledge-status".to_string(),
+        "bpx_knowledge_remove" => args["label"]
+            .as_str()
+            .unwrap_or("knowledge-remove")
+            .to_string(),
         _ => tool_name.to_string(),
     }
 }
@@ -1079,6 +1411,7 @@ mod tests {
             &json!({ "queries": ["needle"], "limit": 4 }),
             &config,
             &store,
+            None,
         )
         .unwrap();
 
@@ -1107,6 +1440,7 @@ mod tests {
             &json!({ "queries": ["needle"], "limit": 1, "snippet_bytes": 120 }),
             &config,
             &store,
+            None,
         )
         .unwrap();
 
@@ -1271,7 +1605,8 @@ mod tests {
         let content = format!("{}{}", "needle ".repeat(5), "h".repeat(1500));
         store.index("hint", &content, None).unwrap();
 
-        let result = handle_search(&json!({ "queries": ["needle"] }), &config, &store).unwrap();
+        let result =
+            handle_search(&json!({ "queries": ["needle"] }), &config, &store, None).unwrap();
 
         assert!(result.contains("Some results were truncated"));
         assert!(result.contains("bpx_read_chunks"));
@@ -1327,5 +1662,314 @@ mod tests {
         assert!(result.contains("Context Budget"));
         assert!(result.contains("Tokens used:"));
         assert!(result.contains("Sources tracked:"));
+    }
+
+    // ── Knowledge handler tests ─────────────────────────────────────────────
+
+    fn make_knowledge_store() -> KnowledgeStore {
+        knowledge::open_in_memory().expect("in-memory knowledge store")
+    }
+
+    #[test]
+    fn test_knowledge_add_requires_path_and_label() {
+        let ks = make_knowledge_store();
+        let config = test_config();
+
+        let result = handle_knowledge_add(&json!({}), &ks, &config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("path is required"));
+
+        let result = handle_knowledge_add(&json!({"path": "/tmp"}), &ks, &config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("label is required"));
+    }
+
+    #[test]
+    fn test_knowledge_add_rejects_nonexistent_path() {
+        let ks = make_knowledge_store();
+        let config = test_config();
+
+        let result = handle_knowledge_add(
+            &json!({"path": "/nonexistent/path/xyz", "label": "test"}),
+            &ks,
+            &config,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("does not exist"));
+    }
+
+    #[test]
+    fn test_knowledge_add_registers_and_syncs() {
+        let dir = tempdir().unwrap();
+        write_file(dir.path(), "note.md", "# Hello\nSome content here.");
+
+        let ks = make_knowledge_store();
+        let config = test_config();
+
+        let result = handle_knowledge_add(
+            &json!({
+                "path": dir.path().display().to_string(),
+                "label": "test-src"
+            }),
+            &ks,
+            &config,
+        )
+        .unwrap();
+
+        assert!(result.contains("Knowledge source 'test-src' registered and synced"));
+        assert!(result.contains("Files indexed: 1"));
+    }
+
+    #[test]
+    fn test_knowledge_sync_specific_source() {
+        let dir = tempdir().unwrap();
+        write_file(dir.path(), "a.md", "content");
+
+        let ks = make_knowledge_store();
+        ks.add_source("src", &dir.path().display().to_string(), None, &[])
+            .unwrap();
+
+        let result = handle_knowledge_sync(&json!({"label": "src"}), &ks).unwrap();
+        assert!(result.contains("Source 'src'"));
+        assert!(result.contains("+1 added"));
+    }
+
+    #[test]
+    fn test_knowledge_sync_all_sources() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        write_file(dir1.path(), "a.md", "content a");
+        write_file(dir2.path(), "b.md", "content b");
+
+        let ks = make_knowledge_store();
+        ks.add_source("s1", &dir1.path().display().to_string(), None, &[])
+            .unwrap();
+        ks.add_source("s2", &dir2.path().display().to_string(), None, &[])
+            .unwrap();
+
+        let result = handle_knowledge_sync(&json!({}), &ks).unwrap();
+        assert!(result.contains("Source 's1'"));
+        assert!(result.contains("Source 's2'"));
+    }
+
+    #[test]
+    fn test_knowledge_sync_nonexistent_source_errors() {
+        let ks = make_knowledge_store();
+        let result = handle_knowledge_sync(&json!({"label": "nosource"}), &ks);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_knowledge_sync_no_sources_returns_message() {
+        let ks = make_knowledge_store();
+        let result = handle_knowledge_sync(&json!({}), &ks).unwrap();
+        assert!(result.contains("No knowledge sources registered"));
+    }
+
+    #[test]
+    fn test_knowledge_status_empty() {
+        let ks = make_knowledge_store();
+        let result = handle_knowledge_status(&ks).unwrap();
+        assert!(result.contains("No knowledge sources registered"));
+    }
+
+    #[test]
+    fn test_knowledge_status_lists_sources() {
+        let ks = make_knowledge_store();
+        ks.add_source("vault", "/tmp/vault", Some("**/*.md"), &["frontmatter".to_string()])
+            .unwrap();
+
+        let result = handle_knowledge_status(&ks).unwrap();
+        assert!(result.contains("vault"));
+        assert!(result.contains("/tmp/vault"));
+        assert!(result.contains("**/*.md"));
+        assert!(result.contains("frontmatter"));
+    }
+
+    #[test]
+    fn test_knowledge_remove_deletes_source() {
+        let ks = make_knowledge_store();
+        ks.add_source("gone", "/tmp/gone", None, &[]).unwrap();
+
+        let result = handle_knowledge_remove(&json!({"label": "gone"}), &ks).unwrap();
+        assert!(result.contains("Removed knowledge source 'gone'"));
+        assert!(ks.get_source("gone").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_knowledge_remove_nonexistent_errors() {
+        let ks = make_knowledge_store();
+        let result = handle_knowledge_remove(&json!({"label": "nosource"}), &ks);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_knowledge_remove_requires_label() {
+        let ks = make_knowledge_store();
+        let result = handle_knowledge_remove(&json!({}), &ks);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("label is required"));
+    }
+
+    #[test]
+    fn test_knowledge_search_no_results() {
+        let ks = make_knowledge_store();
+        let config = test_config();
+        let result =
+            handle_knowledge_search(&json!({"query": "nonexistent term"}), &ks, &config).unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_knowledge_search_requires_query() {
+        let ks = make_knowledge_store();
+        let config = test_config();
+        let result = handle_knowledge_search(&json!({}), &ks, &config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("query is required"));
+    }
+
+    #[test]
+    fn test_knowledge_search_returns_results() {
+        let dir = tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "test.md",
+            "# Knowledge Test\nThis is a unique marker for search testing.",
+        );
+
+        let ks = make_knowledge_store();
+        ks.add_source("test", &dir.path().display().to_string(), None, &[])
+            .unwrap();
+        let source = ks.get_source("test").unwrap().unwrap();
+        sync_source_with_enrichment(&ks, &source).unwrap();
+
+        let config = test_config();
+        let result = handle_knowledge_search(
+            &json!({"query": "unique marker search"}),
+            &ks,
+            &config,
+        )
+        .unwrap();
+
+        assert!(!result.contains("No results found"));
+        assert!(result.contains("test"));
+    }
+
+    #[test]
+    fn test_search_without_knowledge_works() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        store
+            .index("no-knowledge", "some searchable content", None)
+            .unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["searchable"]}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        assert!(result.contains("searchable"));
+    }
+
+    #[test]
+    fn test_search_with_empty_knowledge_works() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        let ks = make_knowledge_store();
+        store
+            .index("with-empty-ks", "session data", None)
+            .unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["session data"]}),
+            &test_config(),
+            &store,
+            Some(&ks),
+        )
+        .unwrap();
+
+        assert!(result.contains("session data"));
+        // No knowledge section since no sources
+        assert!(!result.contains("Knowledge results"));
+    }
+
+    #[test]
+    fn test_search_with_include_knowledge_false() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        let ks = make_knowledge_store();
+        ks.add_source("src", "/tmp/src", None, &[]).unwrap();
+        store
+            .index("excl-knowledge", "search content", None)
+            .unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["content"], "include_knowledge": false}),
+            &test_config(),
+            &store,
+            Some(&ks),
+        )
+        .unwrap();
+
+        assert!(!result.contains("Knowledge results"));
+    }
+
+    #[test]
+    fn test_is_source_stale_never_synced() {
+        let ks = make_knowledge_store();
+        ks.add_source("stale", "/tmp/stale", None, &[]).unwrap();
+        let source = ks.get_source("stale").unwrap().unwrap();
+
+        assert!(is_source_stale(&source, 60));
+    }
+
+    #[test]
+    fn test_tool_label_knowledge_tools() {
+        assert_eq!(
+            tool_label("bpx_knowledge_add", &json!({"label": "vault"})),
+            "vault"
+        );
+        assert_eq!(
+            tool_label(
+                "bpx_knowledge_sync",
+                &json!({"label": "docs"})
+            ),
+            "knowledge-sync:docs"
+        );
+        assert_eq!(
+            tool_label("bpx_knowledge_sync", &json!({})),
+            "knowledge-sync"
+        );
+        assert_eq!(
+            tool_label("bpx_knowledge_search", &json!({})),
+            "knowledge-search"
+        );
+        assert_eq!(
+            tool_label("bpx_knowledge_status", &json!({})),
+            "knowledge-status"
+        );
+        assert_eq!(
+            tool_label(
+                "bpx_knowledge_remove",
+                &json!({"label": "old"})
+            ),
+            "old"
+        );
     }
 }

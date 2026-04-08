@@ -19,16 +19,31 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, KnowledgeAction};
 use config::Config;
 use embedder::Embed;
+use knowledge::{enrichment, sync, KnowledgeStore};
 use store::ContentStore;
 
 fn project_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Build per-source enrichment fn and sync. Used by CLI Knowledge subcommands.
+fn sync_source_cli(
+    ks: &KnowledgeStore,
+    source: &knowledge::KnowledgeSourceInfo,
+) -> Result<sync::SyncResult> {
+    let base = Path::new(&source.path);
+    let enrichment_fn = enrichment::build_enrichment_fn(&source.enrichments, base);
+    let enrich_ref = enrichment_fn
+        .as_ref()
+        .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+    sync::sync_source(ks, source, enrich_ref)
 }
 
 fn main() -> Result<()> {
@@ -429,6 +444,201 @@ fn main() -> Result<()> {
                 eprintln!("{} {}", "warn:".yellow(), err);
             }
             Ok(())
+        }
+
+        Some(Commands::Knowledge { action }) => {
+            let config = Config::load()?;
+            if !config.knowledge.enabled {
+                println!(
+                    "{}",
+                    "Knowledge store is disabled. Set [knowledge] enabled = true in config."
+                        .yellow()
+                );
+                return Ok(());
+            }
+
+            let mut ks = KnowledgeStore::open()?;
+
+            // Share the embedder for sync operations
+            if config.embeddings.enabled {
+                let model_dir = PathBuf::from(&config.embeddings.model_dir)
+                    .join(&config.embeddings.model);
+                if let Ok(embedder) = embedder::Embedder::new(&model_dir) {
+                    ks.set_embedder(Arc::new(embedder));
+                }
+            }
+
+            // Register config-defined sources idempotently
+            for src_cfg in &config.knowledge.sources {
+                if ks.get_source(&src_cfg.label)?.is_none() {
+                    ks.add_source(
+                        &src_cfg.label,
+                        &src_cfg.path,
+                        src_cfg.glob.as_deref(),
+                        &src_cfg.enrichments,
+                    )?;
+                }
+            }
+
+            match action {
+                KnowledgeAction::Add {
+                    path,
+                    label,
+                    glob,
+                    enrichments,
+                } => {
+                    if !path.is_dir() {
+                        anyhow::bail!(
+                            "Path does not exist or is not a directory: {}",
+                            path.display()
+                        );
+                    }
+                    let path_str = path.to_string_lossy();
+                    ks.add_source(&label, &path_str, glob.as_deref(), &enrichments)?;
+                    let source = ks
+                        .get_source(&label)?
+                        .ok_or_else(|| anyhow::anyhow!("Failed to retrieve source"))?;
+                    let result = sync_source_cli(&ks, &source)?;
+                    println!(
+                        "{} Knowledge source '{}' registered and synced.",
+                        "->".green(),
+                        label
+                    );
+                    println!(
+                        "  Files: {} | Chunks: {} | Duration: {}ms",
+                        result.files_added, result.chunks_total, result.duration_ms
+                    );
+                    Ok(())
+                }
+                KnowledgeAction::Sync { label } => {
+                    let results = if let Some(label) = label {
+                        let source = ks
+                            .get_source(&label)?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Knowledge source '{}' not found", label)
+                            })?;
+                        vec![sync_source_cli(&ks, &source)?]
+                    } else {
+                        let sources = ks.list_sources()?;
+                        let mut results = Vec::new();
+                        for source in &sources {
+                            results.push(sync_source_cli(&ks, source)?);
+                        }
+                        results
+                    };
+                    for r in &results {
+                        println!(
+                            "{} '{}': +{} added, ~{} updated, -{} removed, ={} unchanged ({} chunks, {}ms)",
+                            "->".green(),
+                            r.source_label,
+                            r.files_added,
+                            r.files_updated,
+                            r.files_removed,
+                            r.files_unchanged,
+                            r.chunks_total,
+                            r.duration_ms,
+                        );
+                    }
+                    if results.is_empty() {
+                        println!("{}", "No knowledge sources registered.".yellow());
+                    }
+                    Ok(())
+                }
+                KnowledgeAction::Search {
+                    query,
+                    filter,
+                    source,
+                    limit,
+                } => {
+                    let weights = crate::store::search::SearchWeights {
+                        keyword_weight: config.search.keyword_weight,
+                        vector_weight: config.search.vector_weight,
+                    };
+                    let results = knowledge::search::knowledge_search(
+                        &ks,
+                        &query,
+                        filter.as_deref(),
+                        source.as_deref(),
+                        limit,
+                        &weights,
+                        config.search.snippet_bytes,
+                    )?;
+                    if results.is_empty() {
+                        println!("{}", "No results found.".yellow());
+                    } else {
+                        for (i, r) in results.iter().enumerate() {
+                            println!(
+                                "{} {}. [{}] {} (score: {:.3})",
+                                "->".green(),
+                                i + 1,
+                                r.source_label.cyan(),
+                                r.title.bold(),
+                                r.score
+                            );
+                            println!(
+                                "   File: {} (lines {})",
+                                r.file_path.dimmed(),
+                                r.lines
+                            );
+                            let snippet =
+                                crate::truncate::preview(&r.snippet, 200);
+                            println!("   {snippet}\n");
+                        }
+                        println!("{} results", results.len());
+                    }
+                    Ok(())
+                }
+                KnowledgeAction::Status => {
+                    let sources = ks.list_sources()?;
+                    if sources.is_empty() {
+                        println!("{}", "No knowledge sources registered.".yellow());
+                    } else {
+                        println!("{}", "Knowledge Sources:".bold());
+                        println!();
+                        for s in &sources {
+                            println!(
+                                "  {} {}",
+                                "->".green(),
+                                s.label.bold(),
+                            );
+                            println!("    Path: {}", s.path);
+                            println!(
+                                "    Glob: {}",
+                                s.glob.as_deref().unwrap_or("all files")
+                            );
+                            println!(
+                                "    Enrichments: {}",
+                                if s.enrichments.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    s.enrichments.join(", ")
+                                }
+                            );
+                            println!(
+                                "    Files: {} | Chunks: {}",
+                                s.file_count, s.chunk_count
+                            );
+                            println!(
+                                "    Last sync: {}",
+                                s.last_sync.as_deref().unwrap_or("never")
+                            );
+                            println!();
+                        }
+                    }
+                    Ok(())
+                }
+                KnowledgeAction::Remove { label } => {
+                    let result = ks.remove_source(&label)?;
+                    println!(
+                        "{} Removed knowledge source '{}'. Deleted {} files, {} chunks.",
+                        "->".green(),
+                        label,
+                        result.files_removed,
+                        result.chunks_removed
+                    );
+                    Ok(())
+                }
+            }
         }
 
         None => {

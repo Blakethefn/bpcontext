@@ -5,10 +5,6 @@
 //! ContentStore — shares the same chunker and embedder but uses a separate
 //! global database that survives across sessions.
 
-// Foundation module — all public items are consumed by later implementation
-// prompts (P02-P06). Suppressing dead_code for the entire module is correct.
-#![allow(dead_code)]
-
 pub mod db;
 pub mod enrichment;
 pub mod filter;
