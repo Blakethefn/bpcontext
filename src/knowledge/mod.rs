@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod db;
+pub mod sync;
 
 use anyhow::{anyhow, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -230,12 +231,17 @@ impl KnowledgeStore {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    /// Get a reference to the embedder, if available.
+    pub fn embedder(&self) -> Option<&Arc<dyn Embed>> {
+        self.embedder.as_ref()
+    }
 }
 
 /// Open an in-memory knowledge store for tests. Uses the same schema as the
 /// on-disk store but doesn't persist to disk.
 #[cfg(test)]
-fn open_in_memory() -> anyhow::Result<KnowledgeStore> {
+pub(crate) fn open_in_memory() -> anyhow::Result<KnowledgeStore> {
     use crate::db::open_db;
     use std::path::PathBuf;
     let conn = open_db(&PathBuf::from(":memory:"))?;
