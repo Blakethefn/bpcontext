@@ -59,7 +59,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "bpx_search",
-                "description": "Primary retrieval tool after indexing. Search indexed content using multi-layer search and use the returned source_id for exact follow-up reads via bpx_read_chunks. When knowledge sources are registered, also searches persistent knowledge index and merges results. REVIEW RULE: bpx_search is for discovery, not for repo-wide claims. Before stating 'no endpoint checks X' or 'all routes do Y', you MUST confirm with exact reads (Read tool or bpx_read_chunks) on the specific files. Search results show where matches exist — absence from results does NOT prove absence from the codebase.",
+                "description": "Primary retrieval tool after indexing. Search indexed content using multi-layer search and use the returned source_id for exact follow-up reads via bpx_read_chunks. When knowledge sources are registered, also searches persistent knowledge index and merges results. REVIEW RULE: bpx_search is for discovery, not for repo-wide claims. Before stating 'no endpoint checks X' or 'all routes do Y', you MUST confirm with exact reads (Read tool or bpx_read_chunks) on the specific files. Search results show where matches exist — absence from results does NOT prove absence from the codebase. Pass count_only: true for a pre-flight size check before committing to a full result set.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -92,6 +92,10 @@ pub fn tool_definitions() -> Value {
                         "filter": {
                             "type": "string",
                             "description": "Metadata filter for knowledge results (e.g., 'type:task status:active')"
+                        },
+                        "count_only": {
+                            "type": "boolean",
+                            "description": "If true, returns only chunk count and estimated token size — no content. Use before large queries to decide whether to inline or delegate to a subagent."
                         }
                     },
                     "required": ["queries"]
