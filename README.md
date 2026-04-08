@@ -116,11 +116,86 @@ bpcontext context-status
 | `bpx_execute` | Run a shell command, index the output, return a preview |
 | `bpx_execute_file` | Read and index a file with optional processing |
 | `bpx_batch_execute` | Run multiple commands + search queries in one call |
-| `bpx_search` | Search indexed content (BM25, trigram, fuzzy, vector similarity) |
+| `bpx_search` | Search session index and knowledge store (BM25, trigram, fuzzy, vector similarity, merged via RRF) |
 | `bpx_fetch_and_index` | Fetch a URL, convert HTML to markdown, index it |
 | `bpx_index` | Index raw text for later search |
+| `bpx_index_dir` | Index all files in a directory for the current session |
 | `bpx_promote` | Export search results to an Obsidian note via TaskVault |
 | `bpx_stats` | Show context savings metrics for the session |
+| `bpx_context_status` | Show context budget and per-source breakdown |
+| `bpx_read_chunks` | Read specific chunks by ID |
+
+**Knowledge store tools (persistent across sessions):**
+
+| Tool | What it does |
+|------|-------------|
+| `bpx_knowledge_add` | Register a directory as a persistent knowledge source and run initial sync |
+| `bpx_knowledge_sync` | Incrementally re-index changed files across all registered sources |
+| `bpx_knowledge_status` | List registered sources, chunk counts, and last sync time |
+| `bpx_knowledge_remove` | Unregister a knowledge source and delete all its indexed content |
+
+## Knowledge Store (RAG)
+
+The knowledge store is a persistent RAG layer that survives across sessions. Unlike the session-scoped index (which is rebuilt each time), the knowledge store registers directories as durable sources and only re-indexes files that have changed (incremental sync via SHA-256 content hash).
+
+This means you can register your project's source directory once and search it in any future session without re-indexing.
+
+### CLI
+
+```bash
+# Register a directory as a knowledge source
+bpcontext knowledge add /path/to/project/src --label myproject
+
+# Filter by file type
+bpcontext knowledge add /path/to/docs --label mydocs --glob "**/*.md"
+
+# Enable enrichments (for Obsidian vaults)
+bpcontext knowledge add /path/to/vault --label vault --enrichments frontmatter,wikilinks,folder_tags
+
+# Re-sync all sources (re-indexes changed files only)
+bpcontext knowledge sync
+
+# Re-sync a specific source
+bpcontext knowledge sync --label myproject
+
+# Check status
+bpcontext knowledge status
+
+# Search
+bpcontext knowledge search "authentication flow"
+
+# Remove a source
+bpcontext knowledge remove --label myproject
+```
+
+### Session index vs. knowledge store
+
+| | Session index | Knowledge store |
+|---|---|---|
+| Lifetime | Current session only | Persistent across sessions |
+| How populated | `bpx_execute`, `bpx_index`, `bpx_index_dir` | `bpx_knowledge_add` / `bpcontext knowledge add` |
+| Re-index cost | Full re-index every session | Incremental — only changed files |
+| Use case | One-off exploration | Frequently referenced codebases and docs |
+
+`bpx_search` queries **both** layers simultaneously and merges results via RRF, so you get session-context results and persistent knowledge in a single call.
+
+### Enrichments
+
+Enrichments extract structured metadata at index time for richer filtering:
+
+| Enrichment | What it extracts |
+|---|---|
+| `frontmatter` | YAML frontmatter fields (e.g., `status`, `type`, `tags`) |
+| `wikilinks` | Outgoing `[[wikilinks]]` from Obsidian notes |
+| `folder_tags` | Parent folder names as implicit tags |
+
+Enrichments are stored alongside each chunk and available for metadata filtering in search results.
+
+### Data storage
+
+The knowledge store uses a single global database separate from per-session content databases:
+
+- **Knowledge DB:** `~/.local/share/bpcontext/knowledge.db` — registered sources, file hashes, chunks, and embeddings
 
 ## Claude Code Hooks
 
@@ -208,6 +283,7 @@ src/
   config.rs       — TOML config loading
   db.rs           — SQLite connection and session DB management
   fetch.rs        — URL fetching and HTML-to-markdown conversion
+  indexdir.rs     — Directory indexing for bpx_index_dir
   promote.rs      — Export results to Obsidian via TaskVault
   stats.rs        — Context savings tracking
   truncate.rs     — Head/tail preview generation
@@ -215,6 +291,7 @@ src/
   embedder/       — Local embedding model (Candle + all-MiniLM-L6-v2)
   executor/       — Command execution and output capture
   hooks/          — Claude Code hook handlers (pre/post tool use, precompact)
+  knowledge/      — Persistent knowledge store (RAG): source registry, incremental sync, enrichments, search
   mcp/            — MCP server (JSON-RPC over stdio)
   session/        — Session lifecycle and event tracking
   store/          — Chunking, FTS5 indexing, and multi-layer search (BM25 + trigram + fuzzy + vector)
@@ -224,8 +301,9 @@ src/
 
 All runtime data is stored under XDG-standard directories:
 
-- **Content DBs:** `~/.local/share/bpcontext/content/{hash}.db` — per-project FTS5 indexes + embeddings
+- **Content DBs:** `~/.local/share/bpcontext/content/{hash}.db` — per-project FTS5 indexes + embeddings (session-scoped)
 - **Session DBs:** `~/.local/share/bpcontext/sessions/{hash}.db` — events + context ledger
+- **Knowledge DB:** `~/.local/share/bpcontext/knowledge.db` — persistent knowledge store (source registry, file hashes, chunks, embeddings)
 - **Models:** `~/.local/share/bpcontext/models/` — downloaded embedding weights
 - **Config:** `~/.config/bpcontext/config.toml`
 
