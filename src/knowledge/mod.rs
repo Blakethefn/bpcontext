@@ -11,6 +11,8 @@
 
 pub mod db;
 pub mod enrichment;
+pub mod filter;
+pub mod search;
 pub mod sync;
 
 use anyhow::{anyhow, Result};
