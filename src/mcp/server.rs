@@ -440,6 +440,7 @@ fn handle_search(
         .unwrap_or(config.search.snippet_bytes as u64) as usize;
     let include_knowledge = args["include_knowledge"].as_bool().unwrap_or(true);
     let knowledge_filter = args["filter"].as_str();
+    let count_only = args["count_only"].as_bool().unwrap_or(false);
 
     let weights = search_weights(config);
 
@@ -448,6 +449,11 @@ fn handle_search(
         && knowledge_store
             .map(|ks| !ks.list_sources().unwrap_or_default().is_empty())
             .unwrap_or(false);
+
+    // Accumulators for count_only mode
+    let mut co_total_chunks: usize = 0;
+    let mut co_total_bytes: u64 = 0;
+    let mut co_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let mut output = String::new();
     let mut visible_bytes = 0u64;
@@ -479,6 +485,20 @@ fn handle_search(
         } else {
             Vec::new()
         };
+
+        // COUNT-ONLY: accumulate stats and skip content serialization
+        if count_only {
+            for r in &results {
+                co_total_bytes += r.content.len() as u64;
+                co_sources.insert(r.source.clone());
+            }
+            for kr in &knowledge_results {
+                co_total_bytes += kr.snippet.len() as u64;
+                co_sources.insert(kr.source_label.clone());
+            }
+            co_total_chunks += results.len() + knowledge_results.len();
+            continue;
+        }
 
         output.push_str(&format!("### \"{query}\"\n"));
 
@@ -535,6 +555,28 @@ fn handle_search(
                 );
             }
         }
+    }
+
+    // COUNT-ONLY: return size metadata without content
+    if count_only {
+        let estimated_tokens = (co_total_bytes as f64 / 4.0).ceil() as u32;
+        let recommendation = if estimated_tokens <= 20_000 { "inline" } else { "delegate" };
+        let mut sources_vec: Vec<String> = co_sources.into_iter().collect();
+        sources_vec.sort();
+        let queries_echo: Vec<serde_json::Value> = queries
+            .iter()
+            .filter_map(|q| q.as_str())
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .collect();
+        return Ok(serde_json::to_string_pretty(&json!({
+            "count_only": true,
+            "queries": queries_echo,
+            "total_chunks": co_total_chunks,
+            "estimated_bytes": co_total_bytes,
+            "estimated_tokens": estimated_tokens,
+            "sources_matched": sources_vec,
+            "recommendation": recommendation
+        }))?);
     }
 
     // Negative-claim warning for broad queries
@@ -1928,6 +1970,178 @@ mod tests {
         .unwrap();
 
         assert!(!result.contains("Knowledge results"));
+    }
+
+    // ── count_only mode tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_count_only_returns_no_content() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        store.index("co-src", "hello world needle", None).unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["needle"], "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["count_only"], true);
+        assert!(v["total_chunks"].as_u64().unwrap() > 0);
+        // No chunk content in the response
+        assert!(!result.contains("hello world needle"));
+    }
+
+    #[test]
+    fn test_count_only_total_matches_full_call() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        store.index("match-a", "unique_keyword_xyz alpha", None).unwrap();
+        store.index("match-b", "unique_keyword_xyz beta", None).unwrap();
+
+        let count_result = handle_search(
+            &json!({"queries": ["unique_keyword_xyz"], "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+        let full_result = handle_search(
+            &json!({"queries": ["unique_keyword_xyz"]}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        let cv: serde_json::Value = serde_json::from_str(&count_result).unwrap();
+        let count_chunks = cv["total_chunks"].as_u64().unwrap();
+
+        // Count the "**[" occurrences in the full result as a proxy for result count
+        let full_chunks = full_result.matches("**[").count() as u64;
+        assert_eq!(count_chunks, full_chunks);
+    }
+
+    #[test]
+    fn test_count_only_token_estimate_is_ceil_bytes_over_4() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        store.index("tok-src", "estimate_keyword_abc ".repeat(10).trim(), None).unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["estimate_keyword_abc"], "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let bytes = v["estimated_bytes"].as_u64().unwrap();
+        let tokens = v["estimated_tokens"].as_u64().unwrap();
+        let expected = ((bytes as f64) / 4.0).ceil() as u64;
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn test_recommendation_inline_when_under_threshold() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        // Small content — well under 20k tokens
+        store.index("small-src", "inline_threshold_kw small content", None).unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["inline_threshold_kw"], "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["recommendation"], "inline");
+    }
+
+    #[test]
+    fn test_recommendation_delegate_when_over_threshold() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        // 20k tokens = 80k bytes. Index 30 sources with ~3000 bytes each = ~90k bytes.
+        // Each chunk stays under MAX_CHUNK_BYTES (4096) so no splitting, ensuring
+        // each source contributes exactly one chunk to the search results.
+        for i in 0..30usize {
+            let content = format!("delegate_threshold_kw {}", "x".repeat(2960 - i));
+            store.index(&format!("big-src-{i}"), &content, None).unwrap();
+        }
+
+        let result = handle_search(
+            &json!({"queries": ["delegate_threshold_kw"], "limit": 30, "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["recommendation"], "delegate");
+    }
+
+    #[test]
+    fn test_count_only_false_behaves_as_normal() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        store.index("norm-src", "normal_kw_check content here", None).unwrap();
+
+        let with_false = handle_search(
+            &json!({"queries": ["normal_kw_check"], "count_only": false}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+        let without = handle_search(
+            &json!({"queries": ["normal_kw_check"]}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(with_false, without);
+    }
+
+    #[test]
+    fn test_limit_param_respected_in_count_mode() {
+        reset_stats();
+        let (_dir, store) = make_store();
+        for i in 0..10usize {
+            store.index(&format!("lim-src-{i}"), &format!("limit_kw_test content {i}"), None).unwrap();
+        }
+
+        let limited = handle_search(
+            &json!({"queries": ["limit_kw_test"], "limit": 3, "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+        let unlimited = handle_search(
+            &json!({"queries": ["limit_kw_test"], "count_only": true}),
+            &test_config(),
+            &store,
+            None,
+        )
+        .unwrap();
+
+        let lv: serde_json::Value = serde_json::from_str(&limited).unwrap();
+        let uv: serde_json::Value = serde_json::from_str(&unlimited).unwrap();
+        let limited_count = lv["total_chunks"].as_u64().unwrap();
+        let unlimited_count = uv["total_chunks"].as_u64().unwrap();
+        assert!(limited_count <= 3, "limit=3 should cap chunks at 3, got {limited_count}");
+        assert!(unlimited_count > limited_count, "unlimited should return more chunks");
     }
 
     #[test]
