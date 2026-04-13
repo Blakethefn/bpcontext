@@ -67,6 +67,8 @@ pub struct RelatedChunk {
     pub content: String,
     pub link_type: String,
     pub direction: &'static str,
+    /// Traversal depth: 1 = direct link, 2 = link-of-link, etc.
+    pub hop: u32,
 }
 
 /// Aggregated link count per file (count-only mode).
@@ -76,6 +78,8 @@ pub struct LinkCount {
     pub link_type: String,
     pub direction: &'static str,
     pub chunk_count: i64,
+    /// Traversal depth: 1 = direct link, 2 = link-of-link, etc.
+    pub hop: u32,
 }
 
 /// Parse a JSON-encoded enrichments array. Returns an empty vec on failure.
@@ -353,6 +357,7 @@ impl KnowledgeStore {
                     content: row.get(4)?,
                     link_type: row.get(5)?,
                     direction: "forward",
+                    hop: 1,
                 })
             })?;
             for row in rows {
@@ -391,12 +396,166 @@ impl KnowledgeStore {
                         content: row.get(4)?,
                         link_type: row.get(5)?,
                         direction: "backward",
+                        hop: 1,
                     })
                 })?;
                 for row in rows {
                     results.push(row?);
                 }
             }
+        }
+
+        Ok(results)
+    }
+
+    /// Get linked file_ids for BFS frontier expansion (no content fetched).
+    fn get_linked_file_ids(
+        &self,
+        file_id: i64,
+        direction: LinkDirection,
+    ) -> Result<Vec<i64>> {
+        let mut ids = Vec::new();
+
+        if matches!(direction, LinkDirection::Forward | LinkDirection::Both) {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT kl.target_file_id FROM knowledge_links kl
+                 WHERE kl.source_file_id = ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![file_id], |row| row.get(0))?;
+            for row in rows {
+                ids.push(row?);
+            }
+        }
+
+        if matches!(direction, LinkDirection::Backward | LinkDirection::Both) {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT kl.source_file_id FROM knowledge_links kl
+                 WHERE kl.target_file_id = ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![file_id], |row| row.get(0))?;
+            for row in rows {
+                ids.push(row?);
+            }
+        }
+
+        Ok(ids)
+    }
+
+    /// Multi-hop BFS traversal returning chunks with hop annotations.
+    ///
+    /// Iteratively expands the frontier up to `depth` hops. Uses a visited set
+    /// to prevent cycles. Caps the frontier at 50 file_ids per hop to prevent
+    /// graph explosion. Global `max_results` caps total chunks across all hops.
+    pub fn get_related_chunks_multi_hop(
+        &self,
+        origin_file_id: i64,
+        direction: LinkDirection,
+        max_results: usize,
+        depth: u32,
+        filter_predicates: Option<&[filter::FilterPredicate]>,
+    ) -> Result<Vec<RelatedChunk>> {
+        use std::collections::HashSet;
+
+        const MAX_FRONTIER: usize = 50;
+        let mut results = Vec::new();
+        let mut visited: HashSet<i64> = HashSet::new();
+        visited.insert(origin_file_id);
+
+        let mut frontier = vec![origin_file_id];
+
+        for hop in 1..=depth {
+            let mut next_frontier = Vec::new();
+
+            for &fid in &frontier {
+                let remaining = max_results.saturating_sub(results.len());
+                if remaining == 0 {
+                    break;
+                }
+
+                let mut chunks = self.get_related_chunks_filtered(
+                    fid,
+                    direction,
+                    remaining,
+                    filter_predicates,
+                )?;
+
+                // Collect new file_ids for next hop's frontier
+                let linked_ids = self.get_linked_file_ids(fid, direction)?;
+                for id in linked_ids {
+                    if visited.insert(id) {
+                        next_frontier.push(id);
+                    }
+                }
+
+                // Set hop number and filter out already-visited file chunks
+                // (except for the current hop's results from unvisited files)
+                for chunk in &mut chunks {
+                    chunk.hop = hop;
+                }
+                // Only keep chunks from files we haven't seen in prior hops
+                chunks.retain(|c| {
+                    // For hop 1, all files are new (origin is excluded by query).
+                    // For hop 2+, only keep chunks from files first discovered this hop.
+                    hop == 1 || !frontier.contains(&c.file_id)
+                });
+                results.extend(chunks);
+            }
+
+            if results.len() >= max_results || next_frontier.is_empty() {
+                break;
+            }
+
+            // Cap frontier to prevent explosion
+            next_frontier.truncate(MAX_FRONTIER);
+            frontier = next_frontier;
+        }
+
+        results.truncate(max_results);
+        Ok(results)
+    }
+
+    /// Multi-hop BFS count-only mode — returns link counts with hop annotations.
+    pub fn get_link_counts_multi_hop(
+        &self,
+        origin_file_id: i64,
+        direction: LinkDirection,
+        depth: u32,
+        filter_predicates: Option<&[filter::FilterPredicate]>,
+    ) -> Result<Vec<LinkCount>> {
+        use std::collections::HashSet;
+
+        const MAX_FRONTIER: usize = 50;
+        let mut results = Vec::new();
+        let mut visited: HashSet<i64> = HashSet::new();
+        visited.insert(origin_file_id);
+
+        let mut frontier = vec![origin_file_id];
+
+        for hop in 1..=depth {
+            let mut next_frontier = Vec::new();
+
+            for &fid in &frontier {
+                let mut counts = self.get_link_counts_for_file(fid, direction, filter_predicates)?;
+
+                let linked_ids = self.get_linked_file_ids(fid, direction)?;
+                for id in linked_ids {
+                    if visited.insert(id) {
+                        next_frontier.push(id);
+                    }
+                }
+
+                for count in &mut counts {
+                    count.hop = hop;
+                }
+                results.extend(counts);
+            }
+
+            if next_frontier.is_empty() {
+                break;
+            }
+
+            next_frontier.truncate(MAX_FRONTIER);
+            frontier = next_frontier;
         }
 
         Ok(results)
@@ -445,6 +604,7 @@ impl KnowledgeStore {
                     link_type: row.get(1)?,
                     direction: "forward",
                     chunk_count: row.get(2)?,
+                    hop: 1,
                 })
             })?;
             for row in rows {
@@ -478,6 +638,7 @@ impl KnowledgeStore {
                     link_type: row.get(1)?,
                     direction: "backward",
                     chunk_count: row.get(2)?,
+                    hop: 1,
                 })
             })?;
             for row in rows {

@@ -358,6 +358,10 @@ pub fn tool_definitions() -> Value {
                         "count_only": {
                             "type": "boolean",
                             "description": "If true, returns link counts per file without chunk content. Useful for graph mapping and size estimation."
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "Traversal depth. 1 = direct links (default), 2 = links of links, max 3. Results include a hop annotation."
                         }
                     }
                 }

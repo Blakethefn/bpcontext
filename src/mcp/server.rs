@@ -1223,6 +1223,7 @@ fn handle_knowledge_links(
     let source_label = args["source"].as_str();
     let count_only = args["count_only"].as_bool().unwrap_or(false);
     let filter_predicates = parse_filter(args["filter"].as_str());
+    let depth = args["depth"].as_u64().unwrap_or(1).max(1).min(3) as u32;
 
     // Resolve the starting file_id
     let file_id: i64 = if let Some(file_path) = args["file"].as_str() {
@@ -1283,10 +1284,15 @@ fn handle_knowledge_links(
 
     // Count-only mode: return JSON with link counts per file
     if count_only {
-        let counts = ks.get_link_counts_for_file(file_id, direction, preds)?;
+        let counts = if depth > 1 {
+            ks.get_link_counts_multi_hop(file_id, direction, depth, preds)?
+        } else {
+            ks.get_link_counts_for_file(file_id, direction, preds)?
+        };
         if counts.is_empty() {
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "count_only": true,
+                "depth": depth,
                 "total_files": 0,
                 "total_chunks": 0,
                 "files": []
@@ -1301,11 +1307,13 @@ fn handle_knowledge_links(
                     "link_type": c.link_type,
                     "direction": c.direction,
                     "chunk_count": c.chunk_count,
+                    "hop": c.hop,
                 })
             })
             .collect();
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "count_only": true,
+            "depth": depth,
             "total_files": files.len(),
             "total_chunks": total_chunks,
             "files": files,
@@ -1313,7 +1321,11 @@ fn handle_knowledge_links(
     }
 
     // Content mode: return full chunks
-    let related = ks.get_related_chunks_filtered(file_id, direction, limit, preds)?;
+    let related = if depth > 1 {
+        ks.get_related_chunks_multi_hop(file_id, direction, limit, depth, preds)?
+    } else {
+        ks.get_related_chunks_filtered(file_id, direction, limit, preds)?
+    };
 
     if related.is_empty() {
         return Ok("No linked chunks found.".to_string());
@@ -1322,9 +1334,14 @@ fn handle_knowledge_links(
     let mut out = String::new();
     out.push_str(&format!("Found {} related chunks:\n\n", related.len()));
     for chunk in &related {
+        let hop_label = if depth > 1 {
+            format!(" (hop {})", chunk.hop)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "--- {} [{}] {} ---\n{}\n\n",
-            chunk.rel_path, chunk.link_type, chunk.direction, chunk.content
+            "--- {} [{}] {}{} ---\n{}\n\n",
+            chunk.rel_path, chunk.link_type, chunk.direction, hop_label, chunk.content
         ));
     }
     Ok(out)
