@@ -444,8 +444,9 @@ impl KnowledgeStore {
     /// Multi-hop BFS traversal returning chunks with hop annotations.
     ///
     /// Iteratively expands the frontier up to `depth` hops. Uses a visited set
-    /// to prevent cycles. Caps the frontier at 50 file_ids per hop to prevent
-    /// graph explosion. Global `max_results` caps total chunks across all hops.
+    /// to prevent cycles and an emitted set to deduplicate chunks across frontier
+    /// nodes. Caps the frontier at 50 file_ids per hop to prevent graph explosion.
+    /// Global `max_results` caps total chunks across all hops.
     pub fn get_related_chunks_multi_hop(
         &self,
         origin_file_id: i64,
@@ -458,8 +459,13 @@ impl KnowledgeStore {
 
         const MAX_FRONTIER: usize = 50;
         let mut results = Vec::new();
+        // visited: prevents re-traversing a file_id as a frontier node
         let mut visited: HashSet<i64> = HashSet::new();
         visited.insert(origin_file_id);
+        // emitted: prevents emitting chunks from the same file twice
+        // (when multiple frontier nodes link to the same target)
+        let mut emitted: HashSet<i64> = HashSet::new();
+        emitted.insert(origin_file_id);
 
         let mut frontier = vec![origin_file_id];
 
@@ -487,17 +493,11 @@ impl KnowledgeStore {
                     }
                 }
 
-                // Set hop number and filter out already-visited file chunks
-                // (except for the current hop's results from unvisited files)
+                // Only keep chunks from files we haven't emitted yet
+                chunks.retain(|c| emitted.insert(c.file_id));
                 for chunk in &mut chunks {
                     chunk.hop = hop;
                 }
-                // Only keep chunks from files we haven't seen in prior hops
-                chunks.retain(|c| {
-                    // For hop 1, all files are new (origin is excluded by query).
-                    // For hop 2+, only keep chunks from files first discovered this hop.
-                    hop == 1 || !frontier.contains(&c.file_id)
-                });
                 results.extend(chunks);
             }
 
@@ -514,7 +514,9 @@ impl KnowledgeStore {
         Ok(results)
     }
 
-    /// Multi-hop BFS count-only mode — returns link counts with hop annotations.
+    /// Multi-hop BFS count-only mode — returns deduplicated link counts with hop
+    /// annotations. Each file appears at most once, at the earliest hop where it
+    /// was discovered.
     pub fn get_link_counts_multi_hop(
         &self,
         origin_file_id: i64,
@@ -528,6 +530,7 @@ impl KnowledgeStore {
         let mut results = Vec::new();
         let mut visited: HashSet<i64> = HashSet::new();
         visited.insert(origin_file_id);
+        let mut emitted: HashSet<String> = HashSet::new();
 
         let mut frontier = vec![origin_file_id];
 
@@ -535,7 +538,7 @@ impl KnowledgeStore {
             let mut next_frontier = Vec::new();
 
             for &fid in &frontier {
-                let mut counts = self.get_link_counts_for_file(fid, direction, filter_predicates)?;
+                let counts = self.get_link_counts_for_file(fid, direction, filter_predicates)?;
 
                 let linked_ids = self.get_linked_file_ids(fid, direction)?;
                 for id in linked_ids {
@@ -544,10 +547,16 @@ impl KnowledgeStore {
                     }
                 }
 
-                for count in &mut counts {
-                    count.hop = hop;
+                for mut count in counts {
+                    // Dedup key: (rel_path, direction) — a file appears once at
+                    // its earliest hop regardless of how many frontier nodes
+                    // link to it.
+                    let key = format!("{}:{}", count.rel_path, count.direction);
+                    if emitted.insert(key) {
+                        count.hop = hop;
+                        results.push(count);
+                    }
                 }
-                results.extend(counts);
             }
 
             if next_frontier.is_empty() {
