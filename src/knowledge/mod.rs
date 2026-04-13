@@ -69,6 +69,15 @@ pub struct RelatedChunk {
     pub direction: &'static str,
 }
 
+/// Aggregated link count per file (count-only mode).
+#[derive(Debug, Clone)]
+pub struct LinkCount {
+    pub rel_path: String,
+    pub link_type: String,
+    pub direction: &'static str,
+    pub chunk_count: i64,
+}
+
 /// Parse a JSON-encoded enrichments array. Returns an empty vec on failure.
 fn parse_enrichments(json: &str) -> Vec<String> {
     serde_json::from_str(json).unwrap_or_default()
@@ -288,32 +297,64 @@ impl KnowledgeStore {
         direction: LinkDirection,
         max_results: usize,
     ) -> Result<Vec<RelatedChunk>> {
+        self.get_related_chunks_filtered(file_id, direction, max_results, None)
+    }
+
+    /// Get chunks from files linked to the given file, with optional metadata filtering.
+    ///
+    /// When `filter_predicates` is provided, only chunks whose metadata matches
+    /// all predicates are returned. Predicates are ANDed.
+    pub fn get_related_chunks_filtered(
+        &self,
+        file_id: i64,
+        direction: LinkDirection,
+        max_results: usize,
+        filter_predicates: Option<&[filter::FilterPredicate]>,
+    ) -> Result<Vec<RelatedChunk>> {
         let mut results = Vec::new();
 
+        // Build optional filter clause. ?1 is file_id, so filter params start
+        // at offset 1 (generating ?2, ?3, ...). LIMIT goes after all filter params.
+        let (filter_sql, filter_params) = match filter_predicates {
+            Some(preds) if !preds.is_empty() => {
+                let (clause, params) = filter::predicates_to_sql(preds, 1);
+                (format!(" AND {clause}"), params)
+            }
+            _ => (String::new(), vec![]),
+        };
+        let limit_idx = 2 + filter_params.len();
+
         if matches!(direction, LinkDirection::Forward | LinkDirection::Both) {
-            let mut stmt = self.conn.prepare(
+            let sql = format!(
                 "SELECT kc.rowid, kcm.file_id, kf.rel_path, kc.title, kc.content, kl.link_type
                  FROM knowledge_links kl
                  JOIN knowledge_chunk_meta kcm ON kcm.file_id = kl.target_file_id
                  JOIN knowledge_chunks kc ON kc.rowid = kcm.chunk_rowid
                  JOIN knowledge_files kf ON kf.id = kl.target_file_id
-                 WHERE kl.source_file_id = ?1
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![file_id, max_results as i64],
-                |row| {
-                    Ok(RelatedChunk {
-                        chunk_rowid: row.get(0)?,
-                        file_id: row.get(1)?,
-                        rel_path: row.get(2)?,
-                        title: row.get(3)?,
-                        content: row.get(4)?,
-                        link_type: row.get(5)?,
-                        direction: "forward",
-                    })
-                },
-            )?;
+                 WHERE kl.source_file_id = ?1{filter_sql}
+                 LIMIT ?{limit_idx}"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            param_values.push(Box::new(file_id));
+            for p in &filter_params {
+                param_values.push(Box::new(p.clone()));
+            }
+            param_values.push(Box::new(max_results as i64));
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(RelatedChunk {
+                    chunk_rowid: row.get(0)?,
+                    file_id: row.get(1)?,
+                    rel_path: row.get(2)?,
+                    title: row.get(3)?,
+                    content: row.get(4)?,
+                    link_type: row.get(5)?,
+                    direction: "forward",
+                })
+            })?;
             for row in rows {
                 results.push(row?);
             }
@@ -322,32 +363,125 @@ impl KnowledgeStore {
         if matches!(direction, LinkDirection::Backward | LinkDirection::Both) {
             let remaining = max_results.saturating_sub(results.len());
             if remaining > 0 {
-                let mut stmt = self.conn.prepare(
+                let sql = format!(
                     "SELECT kc.rowid, kcm.file_id, kf.rel_path, kc.title, kc.content, kl.link_type
                      FROM knowledge_links kl
                      JOIN knowledge_chunk_meta kcm ON kcm.file_id = kl.source_file_id
                      JOIN knowledge_chunks kc ON kc.rowid = kcm.chunk_rowid
                      JOIN knowledge_files kf ON kf.id = kl.source_file_id
-                     WHERE kl.target_file_id = ?1
-                     LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![file_id, remaining as i64],
-                    |row| {
-                        Ok(RelatedChunk {
-                            chunk_rowid: row.get(0)?,
-                            file_id: row.get(1)?,
-                            rel_path: row.get(2)?,
-                            title: row.get(3)?,
-                            content: row.get(4)?,
-                            link_type: row.get(5)?,
-                            direction: "backward",
-                        })
-                    },
-                )?;
+                     WHERE kl.target_file_id = ?1{filter_sql}
+                     LIMIT ?{limit_idx}"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                param_values.push(Box::new(file_id));
+                for p in &filter_params {
+                    param_values.push(Box::new(p.clone()));
+                }
+                param_values.push(Box::new(remaining as i64));
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    param_values.iter().map(|p| p.as_ref()).collect();
+
+                let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                    Ok(RelatedChunk {
+                        chunk_rowid: row.get(0)?,
+                        file_id: row.get(1)?,
+                        rel_path: row.get(2)?,
+                        title: row.get(3)?,
+                        content: row.get(4)?,
+                        link_type: row.get(5)?,
+                        direction: "backward",
+                    })
+                })?;
                 for row in rows {
                     results.push(row?);
                 }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Count linked files and their chunks without returning content (count-only mode).
+    pub fn get_link_counts_for_file(
+        &self,
+        file_id: i64,
+        direction: LinkDirection,
+        filter_predicates: Option<&[filter::FilterPredicate]>,
+    ) -> Result<Vec<LinkCount>> {
+        let mut results = Vec::new();
+
+        let (filter_sql, filter_params) = match filter_predicates {
+            Some(preds) if !preds.is_empty() => {
+                let (clause, params) = filter::predicates_to_sql(preds, 1);
+                (format!(" AND {clause}"), params)
+            }
+            _ => (String::new(), vec![]),
+        };
+
+        if matches!(direction, LinkDirection::Forward | LinkDirection::Both) {
+            let sql = format!(
+                "SELECT kf.rel_path, kl.link_type, COUNT(*) as chunk_count
+                 FROM knowledge_links kl
+                 JOIN knowledge_chunk_meta kcm ON kcm.file_id = kl.target_file_id
+                 JOIN knowledge_chunks kc ON kc.rowid = kcm.chunk_rowid
+                 JOIN knowledge_files kf ON kf.id = kl.target_file_id
+                 WHERE kl.source_file_id = ?1{filter_sql}
+                 GROUP BY kf.rel_path, kl.link_type
+                 ORDER BY chunk_count DESC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            param_values.push(Box::new(file_id));
+            for p in &filter_params {
+                param_values.push(Box::new(p.clone()));
+            }
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(LinkCount {
+                    rel_path: row.get(0)?,
+                    link_type: row.get(1)?,
+                    direction: "forward",
+                    chunk_count: row.get(2)?,
+                })
+            })?;
+            for row in rows {
+                results.push(row?);
+            }
+        }
+
+        if matches!(direction, LinkDirection::Backward | LinkDirection::Both) {
+            let sql = format!(
+                "SELECT kf.rel_path, kl.link_type, COUNT(*) as chunk_count
+                 FROM knowledge_links kl
+                 JOIN knowledge_chunk_meta kcm ON kcm.file_id = kl.source_file_id
+                 JOIN knowledge_chunks kc ON kc.rowid = kcm.chunk_rowid
+                 JOIN knowledge_files kf ON kf.id = kl.source_file_id
+                 WHERE kl.target_file_id = ?1{filter_sql}
+                 GROUP BY kf.rel_path, kl.link_type
+                 ORDER BY chunk_count DESC"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            param_values.push(Box::new(file_id));
+            for p in &filter_params {
+                param_values.push(Box::new(p.clone()));
+            }
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                Ok(LinkCount {
+                    rel_path: row.get(0)?,
+                    link_type: row.get(1)?,
+                    direction: "backward",
+                    chunk_count: row.get(2)?,
+                })
+            })?;
+            for row in rows {
+                results.push(row?);
             }
         }
 

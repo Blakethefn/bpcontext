@@ -326,7 +326,7 @@ pub fn tool_definitions() -> Value {
             },
             {
                 "name": "bpx_knowledge_links",
-                "description": "Traverse the knowledge graph. Given a file path or search query, find related chunks via wikilink edges. Supports forward (outgoing), backward (incoming), or both directions.",
+                "description": "Traverse the knowledge graph. Given a file path or search query, find related chunks via wikilink edges. Supports forward (outgoing), backward (incoming), or both directions. Use count_only for graph mapping without content. Use filter to narrow by metadata.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -350,6 +350,14 @@ pub fn tool_definitions() -> Value {
                         "limit": {
                             "type": "integer",
                             "description": "Maximum chunks to return. Default: 20."
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Metadata filter for linked files (e.g. 'type:task status:active tag:output folder:01-projects'). Multiple predicates are ANDed."
+                        },
+                        "count_only": {
+                            "type": "boolean",
+                            "description": "If true, returns link counts per file without chunk content. Useful for graph mapping and size estimation."
                         }
                     }
                 }

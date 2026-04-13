@@ -1211,6 +1211,7 @@ fn handle_knowledge_links(
     ks: &crate::knowledge::KnowledgeStore,
     config: &crate::config::Config,
 ) -> Result<String> {
+    use crate::knowledge::filter::parse_filter;
     use crate::knowledge::LinkDirection;
 
     let direction = match args["direction"].as_str().unwrap_or("both") {
@@ -1220,6 +1221,8 @@ fn handle_knowledge_links(
     };
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
     let source_label = args["source"].as_str();
+    let count_only = args["count_only"].as_bool().unwrap_or(false);
+    let filter_predicates = parse_filter(args["filter"].as_str());
 
     // Resolve the starting file_id
     let file_id: i64 = if let Some(file_path) = args["file"].as_str() {
@@ -1272,7 +1275,45 @@ fn handle_knowledge_links(
         anyhow::bail!("Either 'file' or 'query' is required");
     };
 
-    let related = ks.get_related_chunks_for_file(file_id, direction, limit)?;
+    let preds = if filter_predicates.is_empty() {
+        None
+    } else {
+        Some(filter_predicates.as_slice())
+    };
+
+    // Count-only mode: return JSON with link counts per file
+    if count_only {
+        let counts = ks.get_link_counts_for_file(file_id, direction, preds)?;
+        if counts.is_empty() {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({
+                "count_only": true,
+                "total_files": 0,
+                "total_chunks": 0,
+                "files": []
+            }))?);
+        }
+        let total_chunks: i64 = counts.iter().map(|c| c.chunk_count).sum();
+        let files: Vec<serde_json::Value> = counts
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "rel_path": c.rel_path,
+                    "link_type": c.link_type,
+                    "direction": c.direction,
+                    "chunk_count": c.chunk_count,
+                })
+            })
+            .collect();
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "count_only": true,
+            "total_files": files.len(),
+            "total_chunks": total_chunks,
+            "files": files,
+        }))?);
+    }
+
+    // Content mode: return full chunks
+    let related = ks.get_related_chunks_filtered(file_id, direction, limit, preds)?;
 
     if related.is_empty() {
         return Ok("No linked chunks found.".to_string());
