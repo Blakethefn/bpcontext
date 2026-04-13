@@ -323,6 +323,36 @@ pub fn tool_definitions() -> Value {
                     },
                     "required": ["label"]
                 }
+            },
+            {
+                "name": "bpx_knowledge_links",
+                "description": "Traverse the knowledge graph. Given a file path or search query, find related chunks via wikilink edges. Supports forward (outgoing), backward (incoming), or both directions.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": {
+                            "type": "string",
+                            "description": "Relative path within a knowledge source (e.g. '01-projects/bpcontext.md'). Mutually exclusive with 'query'."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to find a starting file. The top result's file is used as the traversal origin. Mutually exclusive with 'file'."
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Knowledge source label to scope the lookup."
+                        },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "backward", "both"],
+                            "description": "Traversal direction. Default: both."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum chunks to return. Default: 20."
+                        }
+                    }
+                }
             }
         ]
     })

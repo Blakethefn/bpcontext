@@ -88,9 +88,19 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             dim         INTEGER NOT NULL DEFAULT 384
         );
 
+        CREATE TABLE IF NOT EXISTS knowledge_links (
+            source_file_id INTEGER NOT NULL REFERENCES knowledge_files(id) ON DELETE CASCADE,
+            target_file_id INTEGER NOT NULL REFERENCES knowledge_files(id) ON DELETE CASCADE,
+            link_type      TEXT NOT NULL,
+            confidence     REAL NOT NULL DEFAULT 1.0,
+            PRIMARY KEY (source_file_id, target_file_id, link_type)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_chunk_meta_source ON knowledge_chunk_meta(source_id);
         CREATE INDEX IF NOT EXISTS idx_chunk_meta_file ON knowledge_chunk_meta(file_id);
         CREATE INDEX IF NOT EXISTS idx_files_source ON knowledge_files(source_id);
+        CREATE INDEX IF NOT EXISTS idx_links_source ON knowledge_links(source_file_id);
+        CREATE INDEX IF NOT EXISTS idx_links_target ON knowledge_links(target_file_id);
         ",
     )?;
     Ok(())

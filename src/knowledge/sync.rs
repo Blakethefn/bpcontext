@@ -31,6 +31,7 @@ pub struct SyncResult {
     pub files_removed: usize,
     pub files_unchanged: usize,
     pub chunks_total: usize,
+    pub links_created: usize,
     pub duration_ms: u64,
 }
 
@@ -94,7 +95,7 @@ pub fn sync_source(
     // 4. Execute in a single transaction
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    let inner = (|| -> Result<()> {
+    let inner = (|| -> Result<usize> {
         // 4a. Remove deleted files
         for file_id in &to_remove {
             delete_file_chunks(conn, *file_id)?;
@@ -148,16 +149,22 @@ pub fn sync_source(
             params![source.id],
         )?;
 
-        Ok(())
+        // 4e. Resolve wikilinks to graph edges
+        let lc = resolve_wikilinks_for_source(conn, source.id)?;
+
+        Ok(lc)
     })();
 
-    match inner {
-        Ok(()) => conn.execute_batch("COMMIT")?,
+    let links_created = match inner {
+        Ok(lc) => {
+            conn.execute_batch("COMMIT")?;
+            lc
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(e);
         }
-    }
+    };
 
     let chunks_total: i64 = conn.query_row(
         "SELECT chunk_count FROM knowledge_sources WHERE id = ?1",
@@ -173,6 +180,7 @@ pub fn sync_source(
         files_removed,
         files_unchanged: unchanged,
         chunks_total: chunks_total as usize,
+        links_created,
         duration_ms: start.elapsed().as_millis() as u64,
     })
 }
@@ -510,6 +518,121 @@ fn is_binary(path: &Path) -> io::Result<bool> {
     let mut buf = [0u8; 1024];
     let bytes_read = file.read(&mut buf)?;
     Ok(buf[..bytes_read].contains(&0u8))
+}
+
+// ── Wikilink graph resolution ──────────────────────────────────────────────
+
+/// Resolve an Obsidian wikilink target to a file ID.
+///
+/// Resolution order:
+/// 1. Exact match on rel_path
+/// 2. Exact match with `.md` appended
+/// 3. Basename match (target matches the filename portion of any rel_path)
+fn resolve_wikilink(target: &str, files: &HashMap<String, i64>) -> Option<i64> {
+    // Exact match
+    if let Some(&id) = files.get(target) {
+        return Some(id);
+    }
+    // With .md extension
+    let with_md = format!("{}.md", target);
+    if let Some(&id) = files.get(&with_md) {
+        return Some(id);
+    }
+    // Basename match: target is just a note name without path
+    let suffix_md = format!("/{}.md", target);
+    let suffix_plain = format!("/{}", target);
+    for (path, &id) in files {
+        if path.ends_with(&suffix_md) || path.ends_with(&suffix_plain) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Delete all wikilink graph edges for a source, then re-resolve from stored
+/// metadata. Runs inside the sync transaction after all files are indexed.
+///
+/// Returns the number of links created.
+fn resolve_wikilinks_for_source(
+    conn: &rusqlite::Connection,
+    source_id: i64,
+) -> Result<usize> {
+    // Delete existing links for this source's files
+    conn.execute(
+        "DELETE FROM knowledge_links WHERE source_file_id IN
+         (SELECT id FROM knowledge_files WHERE source_id = ?1)",
+        params![source_id],
+    )?;
+
+    // Load all file rel_paths → IDs for this source
+    let files: HashMap<String, i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, rel_path FROM knowledge_files WHERE source_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![source_id], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    // For each file, get one metadata row and extract wikilinks
+    let file_wikilinks: Vec<(i64, Vec<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT kf.id, kcm.metadata
+             FROM knowledge_files kf
+             JOIN knowledge_chunk_meta kcm ON kcm.file_id = kf.id
+             WHERE kf.source_id = ?1
+             GROUP BY kf.id",
+        )?;
+        let rows = stmt.query_map(params![source_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(file_id, meta_json)| {
+                let meta: serde_json::Value = serde_json::from_str(&meta_json).ok()?;
+                let links = meta.get("wikilinks")?.as_array()?;
+                let targets: Vec<String> = links
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                if targets.is_empty() {
+                    None
+                } else {
+                    Some((file_id, targets))
+                }
+            })
+            .collect()
+    };
+
+    // Resolve and insert links
+    let mut links_created = 0usize;
+    let mut insert_stmt = conn.prepare(
+        "INSERT OR IGNORE INTO knowledge_links
+            (source_file_id, target_file_id, link_type, confidence)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+
+    for (source_file_id, targets) in &file_wikilinks {
+        for target in targets {
+            if let Some(target_file_id) = resolve_wikilink(target, &files) {
+                if target_file_id != *source_file_id {
+                    insert_stmt.execute(params![
+                        source_file_id,
+                        target_file_id,
+                        "wikilink",
+                        1.0
+                    ])?;
+                    links_created += 1;
+                }
+            }
+        }
+    }
+
+    Ok(links_created)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -948,5 +1071,156 @@ mod tests {
     #[test]
     fn sha256_differs_for_different_input() {
         assert_ne!(sha256_hex(b"input a"), sha256_hex(b"input b"));
+    }
+
+    // ── resolve_wikilink ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_exact_path() {
+        let files: HashMap<String, i64> =
+            [("01-projects/bpcontext.md".into(), 1)].into_iter().collect();
+        assert_eq!(resolve_wikilink("01-projects/bpcontext.md", &files), Some(1));
+    }
+
+    #[test]
+    fn resolve_appends_md_extension() {
+        let files: HashMap<String, i64> =
+            [("notes/idea.md".into(), 2)].into_iter().collect();
+        assert_eq!(resolve_wikilink("notes/idea", &files), Some(2));
+    }
+
+    #[test]
+    fn resolve_basename_match() {
+        let files: HashMap<String, i64> =
+            [("deep/path/my-note.md".into(), 3)].into_iter().collect();
+        assert_eq!(resolve_wikilink("my-note", &files), Some(3));
+    }
+
+    #[test]
+    fn resolve_basename_without_extension() {
+        let files: HashMap<String, i64> =
+            [("folder/config".into(), 4)].into_iter().collect();
+        assert_eq!(resolve_wikilink("config", &files), Some(4));
+    }
+
+    #[test]
+    fn resolve_returns_none_for_missing() {
+        let files: HashMap<String, i64> =
+            [("a.md".into(), 1)].into_iter().collect();
+        assert_eq!(resolve_wikilink("nonexistent", &files), None);
+    }
+
+    // ── wikilink graph resolution (integration) ─────────────────────────────
+
+    fn register_source_with_enrichments(
+        store: &KnowledgeStore,
+        dir: &Path,
+        enrichments: &[&str],
+    ) -> KnowledgeSourceInfo {
+        let e: Vec<String> = enrichments.iter().map(|s| s.to_string()).collect();
+        store
+            .add_source("test", dir.to_str().unwrap(), None, &e)
+            .unwrap();
+        store.get_source("test").unwrap().unwrap()
+    }
+
+    fn link_count(store: &KnowledgeStore, source_id: i64) -> i64 {
+        store.link_count_for_source(source_id).unwrap()
+    }
+
+    #[test]
+    fn sync_creates_wikilink_edges() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.md"),
+            "---\ntype: note\n---\nSee [[b]]",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.md"), "# B\nTarget note").unwrap();
+
+        let source =
+            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn =
+            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
+        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        let result = sync_source(&store, &source, enrich_ref).unwrap();
+
+        assert!(result.links_created > 0, "should create wikilink edges");
+        assert!(link_count(&store, source.id) > 0);
+    }
+
+    #[test]
+    fn sync_no_self_links() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+        // File links to itself
+        fs::write(dir.path().join("self.md"), "See [[self]]").unwrap();
+
+        let source =
+            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn =
+            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
+        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        sync_source(&store, &source, enrich_ref).unwrap();
+
+        assert_eq!(link_count(&store, source.id), 0, "self-links should be skipped");
+    }
+
+    #[test]
+    fn sync_unresolvable_links_ignored() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "Link to [[nonexistent]]").unwrap();
+
+        let source =
+            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn =
+            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
+        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        sync_source(&store, &source, enrich_ref).unwrap();
+
+        assert_eq!(link_count(&store, source.id), 0);
+    }
+
+    #[test]
+    fn sync_resync_updates_links() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "See [[b]]").unwrap();
+        fs::write(dir.path().join("b.md"), "# B").unwrap();
+        fs::write(dir.path().join("c.md"), "# C").unwrap();
+
+        let source =
+            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn =
+            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
+        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        sync_source(&store, &source, enrich_ref).unwrap();
+        assert_eq!(link_count(&store, source.id), 1, "a→b");
+
+        // Change a.md to link to c instead
+        fs::write(dir.path().join("a.md"), "See [[c]]").unwrap();
+        let source = store.get_source("test").unwrap().unwrap();
+        let enrich_fn =
+            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
+        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        sync_source(&store, &source, enrich_ref).unwrap();
+
+        // Old a→b link should be gone, new a→c should exist
+        assert_eq!(link_count(&store, source.id), 1, "a→c only");
+    }
+
+    #[test]
+    fn sync_without_enrichments_creates_no_links() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "See [[b]]").unwrap();
+        fs::write(dir.path().join("b.md"), "# B").unwrap();
+
+        let source = register_source(&store, dir.path());
+        sync_source(&store, &source, None).unwrap();
+
+        assert_eq!(link_count(&store, source.id), 0, "no enrichments = no links");
     }
 }

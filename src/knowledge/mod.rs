@@ -46,6 +46,29 @@ pub struct RemoveResult {
     pub chunks_removed: i64,
 }
 
+/// Direction for graph link traversal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LinkDirection {
+    /// Follow outgoing links (this file links to target files).
+    Forward,
+    /// Follow incoming links (other files link to this file).
+    Backward,
+    /// Follow both directions.
+    Both,
+}
+
+/// A chunk discovered through graph traversal.
+#[derive(Debug, Clone)]
+pub struct RelatedChunk {
+    pub chunk_rowid: i64,
+    pub file_id: i64,
+    pub rel_path: String,
+    pub title: String,
+    pub content: String,
+    pub link_type: String,
+    pub direction: &'static str,
+}
+
 /// Parse a JSON-encoded enrichments array. Returns an empty vec on failure.
 fn parse_enrichments(json: &str) -> Vec<String> {
     serde_json::from_str(json).unwrap_or_default()
@@ -235,6 +258,112 @@ impl KnowledgeStore {
     pub fn embedder(&self) -> Option<&Arc<dyn Embed>> {
         self.embedder.as_ref()
     }
+
+    /// Get chunks from files linked to the given chunk's file.
+    ///
+    /// Finds the file for `chunk_rowid`, traverses graph edges in the given
+    /// direction, and returns chunks from linked files.
+    pub fn get_related_chunks(
+        &self,
+        chunk_rowid: i64,
+        direction: LinkDirection,
+        max_results: usize,
+    ) -> Result<Vec<RelatedChunk>> {
+        let file_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT file_id FROM knowledge_chunk_meta WHERE chunk_rowid = ?1",
+                rusqlite::params![chunk_rowid],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow!("chunk rowid {} not found", chunk_rowid))?;
+
+        self.get_related_chunks_for_file(file_id, direction, max_results)
+    }
+
+    /// Get chunks from files linked to the given file.
+    pub fn get_related_chunks_for_file(
+        &self,
+        file_id: i64,
+        direction: LinkDirection,
+        max_results: usize,
+    ) -> Result<Vec<RelatedChunk>> {
+        let mut results = Vec::new();
+
+        if matches!(direction, LinkDirection::Forward | LinkDirection::Both) {
+            let mut stmt = self.conn.prepare(
+                "SELECT kc.rowid, kcm.file_id, kf.rel_path, kc.title, kc.content, kl.link_type
+                 FROM knowledge_links kl
+                 JOIN knowledge_chunk_meta kcm ON kcm.file_id = kl.target_file_id
+                 JOIN knowledge_chunks kc ON kc.rowid = kcm.chunk_rowid
+                 JOIN knowledge_files kf ON kf.id = kl.target_file_id
+                 WHERE kl.source_file_id = ?1
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![file_id, max_results as i64],
+                |row| {
+                    Ok(RelatedChunk {
+                        chunk_rowid: row.get(0)?,
+                        file_id: row.get(1)?,
+                        rel_path: row.get(2)?,
+                        title: row.get(3)?,
+                        content: row.get(4)?,
+                        link_type: row.get(5)?,
+                        direction: "forward",
+                    })
+                },
+            )?;
+            for row in rows {
+                results.push(row?);
+            }
+        }
+
+        if matches!(direction, LinkDirection::Backward | LinkDirection::Both) {
+            let remaining = max_results.saturating_sub(results.len());
+            if remaining > 0 {
+                let mut stmt = self.conn.prepare(
+                    "SELECT kc.rowid, kcm.file_id, kf.rel_path, kc.title, kc.content, kl.link_type
+                     FROM knowledge_links kl
+                     JOIN knowledge_chunk_meta kcm ON kcm.file_id = kl.source_file_id
+                     JOIN knowledge_chunks kc ON kc.rowid = kcm.chunk_rowid
+                     JOIN knowledge_files kf ON kf.id = kl.source_file_id
+                     WHERE kl.target_file_id = ?1
+                     LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![file_id, remaining as i64],
+                    |row| {
+                        Ok(RelatedChunk {
+                            chunk_rowid: row.get(0)?,
+                            file_id: row.get(1)?,
+                            rel_path: row.get(2)?,
+                            title: row.get(3)?,
+                            content: row.get(4)?,
+                            link_type: row.get(5)?,
+                            direction: "backward",
+                        })
+                    },
+                )?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Count graph edges for a source. Useful for sync result reporting.
+    pub fn link_count_for_source(&self, source_id: i64) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM knowledge_links
+             WHERE source_file_id IN (SELECT id FROM knowledge_files WHERE source_id = ?1)",
+            rusqlite::params![source_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
 }
 
 /// Open an in-memory knowledge store for tests. Uses the same schema as the
@@ -280,6 +409,7 @@ mod tests {
             "knowledge_chunks_trigram",
             "knowledge_chunk_meta",
             "knowledge_embeddings",
+            "knowledge_links",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -456,6 +586,23 @@ mod tests {
         let store = make_store();
         assert!(!store.has_embedder());
     }
+
+    // ── get_related_chunks ───────────────────────────────────────────────────
+
+    #[test]
+    fn get_related_chunks_not_found_errors() {
+        let store = make_store();
+        let result = store.get_related_chunks(999, LinkDirection::Both, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn link_count_for_source_empty() {
+        let store = make_store();
+        store.add_source("e", "/tmp/e", None, &[]).unwrap();
+        let src = store.get_source("e").unwrap().unwrap();
+        assert_eq!(store.link_count_for_source(src.id).unwrap(), 0);
+    }
 }
 
 /// Cross-module integration tests exercising the full knowledge store pipeline:
@@ -469,6 +616,7 @@ mod integration_tests {
     use crate::knowledge::{enrichment, search, sync};
     use crate::store::search::SearchWeights;
     use rusqlite::params;
+    use std::fs;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1581,5 +1729,102 @@ mod integration_tests {
             "compound filter should match exactly one file"
         );
         assert_eq!(results[0].title, "Matching Task");
+    }
+
+    // ── Graph traversal integration ─────────────────────────────────────────
+
+    #[test]
+    fn sync_and_traverse_wikilinks() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+
+        // a.md links to b.md and c.md; b.md links back to a.md
+        fs::write(
+            dir.path().join("a.md"),
+            "# Note A\nSee [[b]] and [[c]]",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.md"),
+            "# Note B\nBack to [[a]]",
+        )
+        .unwrap();
+        fs::write(dir.path().join("c.md"), "# Note C\nStandalone").unwrap();
+
+        let enrichments = vec!["wikilinks".to_string()];
+        store
+            .add_source("graph", dir.path().to_str().unwrap(), None, &enrichments)
+            .unwrap();
+        let source = store.get_source("graph").unwrap().unwrap();
+
+        let enrich_fn =
+            enrichment::build_enrichment_fn(&source.enrichments, std::path::Path::new(&source.path));
+        let enrich_ref =
+            enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &std::path::Path) -> serde_json::Value);
+        let result = sync::sync_source(&store, &source, enrich_ref).unwrap();
+
+        // Should have created links: a→b, a→c, b→a
+        assert_eq!(result.links_created, 3, "a→b, a→c, b→a");
+        assert_eq!(store.link_count_for_source(source.id).unwrap(), 3);
+
+        // Find file_id for a.md
+        let a_file_id: i64 = store
+            .conn()
+            .query_row(
+                "SELECT id FROM knowledge_files WHERE source_id = ?1 AND rel_path = 'a.md'",
+                rusqlite::params![source.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // Forward from a: should get chunks from b.md and c.md
+        let forward = store
+            .get_related_chunks_for_file(a_file_id, LinkDirection::Forward, 50)
+            .unwrap();
+        assert!(forward.len() >= 2, "a links to b and c");
+        assert!(forward.iter().all(|c| c.direction == "forward"));
+
+        // Backward to a: should get chunks from b.md (b links to a)
+        let backward = store
+            .get_related_chunks_for_file(a_file_id, LinkDirection::Backward, 50)
+            .unwrap();
+        assert!(!backward.is_empty(), "b links back to a");
+        assert!(backward.iter().all(|c| c.direction == "backward"));
+
+        // Both directions
+        let both = store
+            .get_related_chunks_for_file(a_file_id, LinkDirection::Both, 50)
+            .unwrap();
+        assert!(both.len() >= forward.len() + backward.len());
+    }
+
+    #[test]
+    fn remove_source_cleans_up_links() {
+        let store = make_store();
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("x.md"), "Link to [[y]]").unwrap();
+        fs::write(dir.path().join("y.md"), "# Y").unwrap();
+
+        let enrichments = vec!["wikilinks".to_string()];
+        store
+            .add_source("doomed", dir.path().to_str().unwrap(), None, &enrichments)
+            .unwrap();
+        let source = store.get_source("doomed").unwrap().unwrap();
+
+        let enrich_fn =
+            enrichment::build_enrichment_fn(&source.enrichments, std::path::Path::new(&source.path));
+        let enrich_ref =
+            enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &std::path::Path) -> serde_json::Value);
+        sync::sync_source(&store, &source, enrich_ref).unwrap();
+        assert!(store.link_count_for_source(source.id).unwrap() > 0);
+
+        store.remove_source("doomed").unwrap();
+
+        // Links should be gone (FK cascade)
+        let orphaned: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM knowledge_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphaned, 0, "links cleaned up after source removal");
     }
 }

@@ -260,6 +260,11 @@ fn handle_tool_call(
                 .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
             handle_knowledge_remove(args, ks)
         }
+        "bpx_knowledge_links" => {
+            let ks = knowledge_store
+                .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
+            handle_knowledge_links(args, ks, config)
+        }
         _ => anyhow::bail!("Unknown tool: {tool_name}"),
     }
 }
@@ -1201,6 +1206,89 @@ fn handle_knowledge_remove(args: &Value, ks: &KnowledgeStore) -> Result<String> 
     ))
 }
 
+fn handle_knowledge_links(
+    args: &Value,
+    ks: &crate::knowledge::KnowledgeStore,
+    config: &crate::config::Config,
+) -> Result<String> {
+    use crate::knowledge::LinkDirection;
+
+    let direction = match args["direction"].as_str().unwrap_or("both") {
+        "forward" => LinkDirection::Forward,
+        "backward" => LinkDirection::Backward,
+        _ => LinkDirection::Both,
+    };
+    let limit = args["limit"].as_u64().unwrap_or(20) as usize;
+    let source_label = args["source"].as_str();
+
+    // Resolve the starting file_id
+    let file_id: i64 = if let Some(file_path) = args["file"].as_str() {
+        // Find file by rel_path within a source
+        if let Some(label) = source_label {
+            ks.conn()
+                .query_row(
+                    "SELECT kf.id FROM knowledge_files kf
+                     JOIN knowledge_sources ks ON ks.id = kf.source_id
+                     WHERE ks.label = ?1 AND kf.rel_path = ?2",
+                    rusqlite::params![label, file_path],
+                    |row| row.get(0),
+                )
+                .map_err(|_| anyhow::anyhow!("File '{}' not found in source '{}'", file_path, label))?
+        } else {
+            ks.conn()
+                .query_row(
+                    "SELECT id FROM knowledge_files WHERE rel_path = ?1",
+                    rusqlite::params![file_path],
+                    |row| row.get(0),
+                )
+                .map_err(|_| anyhow::anyhow!("File '{}' not found in knowledge store", file_path))?
+        }
+    } else if let Some(query) = args["query"].as_str() {
+        // Search, use top result's file
+        let weights = search_weights(config);
+        let results = crate::knowledge::search::knowledge_search(
+            ks,
+            query,
+            None,
+            source_label,
+            1,
+            &weights,
+            200,
+        )?;
+        let first = results
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("No search results for '{}'", query))?;
+        // Get file_id from the result's file_path
+        ks.conn()
+            .query_row(
+                "SELECT kf.id FROM knowledge_files kf
+                 JOIN knowledge_sources ks ON ks.id = kf.source_id
+                 WHERE kf.rel_path = ?1",
+                rusqlite::params![first.file_path],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("Could not resolve search result to file"))?
+    } else {
+        anyhow::bail!("Either 'file' or 'query' is required");
+    };
+
+    let related = ks.get_related_chunks_for_file(file_id, direction, limit)?;
+
+    if related.is_empty() {
+        return Ok("No linked chunks found.".to_string());
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Found {} related chunks:\n\n", related.len()));
+    for chunk in &related {
+        out.push_str(&format!(
+            "--- {} [{}] {} ---\n{}\n\n",
+            chunk.rel_path, chunk.link_type, chunk.direction, chunk.content
+        ));
+    }
+    Ok(out)
+}
+
 /// Extract a human-readable label from a tool call for the context ledger.
 fn tool_label(tool_name: &str, args: &Value) -> String {
     match tool_name {
@@ -1239,6 +1327,7 @@ fn tool_label(tool_name: &str, args: &Value) -> String {
             .as_str()
             .unwrap_or("knowledge-remove")
             .to_string(),
+        "bpx_knowledge_links" => "knowledge-links".to_string(),
         _ => tool_name.to_string(),
     }
 }
