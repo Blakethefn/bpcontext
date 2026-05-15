@@ -23,7 +23,10 @@ pub enum FilterPredicate {
 /// Validate that a metadata key contains only safe characters for JSON path
 /// construction. Allows alphanumeric, underscore, and hyphen.
 fn validate_key(key: &str) -> bool {
-    !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Parse a filter string into a list of predicates.
@@ -78,7 +81,10 @@ pub fn parse_filter(filter: Option<&str>) -> Vec<FilterPredicate> {
 ///
 /// The `param_offset` is the starting `?N` index for parameter placeholders
 /// (e.g., if you already have `?1` and `?2` bound, pass `param_offset = 2`).
-pub fn predicates_to_sql(predicates: &[FilterPredicate], param_offset: usize) -> (String, Vec<String>) {
+pub fn predicates_to_sql(
+    predicates: &[FilterPredicate],
+    param_offset: usize,
+) -> (String, Vec<String>) {
     let mut fragments = Vec::new();
     let mut params: Vec<String> = Vec::new();
 
@@ -164,10 +170,7 @@ mod tests {
     fn parse_folder_predicate() {
         let preds = parse_filter(Some("folder:01-projects"));
         assert_eq!(preds.len(), 1);
-        assert_eq!(
-            preds[0],
-            FilterPredicate::Folder("01-projects".to_string())
-        );
+        assert_eq!(preds[0], FilterPredicate::Folder("01-projects".to_string()));
     }
 
     #[test]
@@ -216,10 +219,7 @@ mod tests {
             }
         );
         assert_eq!(preds[2], FilterPredicate::Tag("foo".to_string()));
-        assert_eq!(
-            preds[3],
-            FilterPredicate::Folder("01-projects".to_string())
-        );
+        assert_eq!(preds[3], FilterPredicate::Folder("01-projects".to_string()));
     }
 
     #[test]

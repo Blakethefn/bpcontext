@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 
 use crate::embedder;
+use crate::search_model::SearchWhy;
 use crate::store::search::{SearchResult, SearchWeights};
 use crate::store::ContentStore;
 
@@ -24,9 +25,12 @@ pub struct KnowledgeSearchResult {
     pub score: f64,
     pub source_label: String,
     pub file_path: String,
+    pub file_id: i64,
+    pub source_id: i64,
     pub lines: String,
     pub metadata: serde_json::Value,
     pub source_type: String,
+    pub why: SearchWhy,
 }
 
 /// Search the knowledge DB with optional metadata filtering.
@@ -56,26 +60,30 @@ pub fn knowledge_search(
 
     // Layer 1: FTS5 BM25
     let bm25 = knowledge_bm25_search(conn, query, limit, &meta_where, &meta_params)?;
-    merge_results(&mut all_results, &bm25, weights.keyword_weight);
+    merge_results(&mut all_results, &bm25, weights.keyword_weight, "bm25");
 
     // Layer 2: Trigram (if BM25 returned fewer than limit)
     if bm25.len() < limit as usize {
         let trigram = knowledge_trigram_search(conn, query, limit, &meta_where, &meta_params)?;
-        merge_results(&mut all_results, &trigram, weights.keyword_weight);
+        merge_results(
+            &mut all_results,
+            &trigram,
+            weights.keyword_weight,
+            "trigram",
+        );
     }
 
     // Layer 3: Fuzzy (if still under limit)
     if all_results.len() < limit as usize {
         let fuzzy = knowledge_fuzzy_search(conn, query, limit, &meta_where, &meta_params)?;
-        merge_results(&mut all_results, &fuzzy, weights.keyword_weight);
+        merge_results(&mut all_results, &fuzzy, weights.keyword_weight, "fuzzy");
     }
 
     // Layer 4: Vector similarity
     if let Some(emb) = store.embedder() {
         match emb.embed_one(query) {
             Ok(query_embedding) => {
-                let candidate_rowids: Vec<i64> =
-                    all_results.keys().copied().collect();
+                let candidate_rowids: Vec<i64> = all_results.keys().copied().collect();
                 let candidates = if candidate_rowids.is_empty() {
                     None
                 } else {
@@ -89,10 +97,12 @@ pub fn knowledge_search(
                     &meta_params,
                     candidates,
                 )?;
-                merge_results(&mut all_results, &vector, weights.vector_weight);
+                merge_results(&mut all_results, &vector, weights.vector_weight, "vector");
             }
             Err(e) => {
-                eprintln!("[bpcontext] knowledge query embedding failed, skipping vector layer: {e}");
+                eprintln!(
+                    "[bpcontext] knowledge query embedding failed, skipping vector layer: {e}"
+                );
             }
         }
     }
@@ -126,8 +136,15 @@ pub fn combined_search(
     let session_results = session_store.search_with_weights(query, limit, None, None, weights)?;
 
     // 2. Knowledge search
-    let knowledge_results =
-        knowledge_search(knowledge_store, query, filter, None, limit, weights, snippet_bytes)?;
+    let knowledge_results = knowledge_search(
+        knowledge_store,
+        query,
+        filter,
+        None,
+        limit,
+        weights,
+        snippet_bytes,
+    )?;
 
     // 3. Convert session results to KnowledgeSearchResult
     let session_converted: Vec<KnowledgeSearchResult> = session_results
@@ -153,10 +170,7 @@ pub fn combined_search(
 
     for (rank, result) in knowledge_results.iter().enumerate() {
         let rrf = 1.0 / (K + rank as f64 + 1.0);
-        let key = format!(
-            "knowledge:{}:{}",
-            result.source_label, result.title
-        );
+        let key = format!("knowledge:{}:{}", result.source_label, result.title);
         merged
             .entry(key)
             .and_modify(|m| m.rrf_score += rrf)
@@ -189,6 +203,8 @@ pub fn combined_search(
 #[derive(Debug)]
 struct RankedResult {
     rowid: i64,
+    file_id: i64,
+    source_id: i64,
     title: String,
     content: String,
     rank: f64,
@@ -200,6 +216,8 @@ struct RankedResult {
 }
 
 struct ScoredResult {
+    file_id: i64,
+    source_id: i64,
     title: String,
     content: String,
     source_label: String,
@@ -208,21 +226,25 @@ struct ScoredResult {
     line_end: u32,
     metadata: String,
     rrf_score: f64,
+    why: SearchWhy,
 }
 
 impl ScoredResult {
     fn into_knowledge_result(self, snippet_bytes: usize) -> KnowledgeSearchResult {
-        let metadata: serde_json::Value =
-            serde_json::from_str(&self.metadata).unwrap_or(serde_json::Value::Object(Default::default()));
+        let metadata: serde_json::Value = serde_json::from_str(&self.metadata)
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         KnowledgeSearchResult {
             title: self.title,
             snippet: truncate_snippet(&self.content, snippet_bytes),
             score: self.rrf_score,
             source_label: self.source_label,
             file_path: self.file_path,
+            file_id: self.file_id,
+            source_id: self.source_id,
             lines: format!("{}-{}", self.line_start, self.line_end),
             metadata,
             source_type: "knowledge".to_string(),
+            why: self.why,
         }
     }
 }
@@ -241,9 +263,12 @@ impl Clone for KnowledgeSearchResult {
             score: self.score,
             source_label: self.source_label.clone(),
             file_path: self.file_path.clone(),
+            file_id: self.file_id,
+            source_id: self.source_id,
             lines: self.lines.clone(),
             metadata: self.metadata.clone(),
             source_type: self.source_type.clone(),
+            why: self.why.clone(),
         }
     }
 }
@@ -280,7 +305,7 @@ fn knowledge_bm25_search(
     };
 
     let sql = format!(
-        "SELECT kc.rowid, kc.title, kc.content,
+        "SELECT kc.rowid, kcm.file_id, kcm.source_id, kc.title, kc.content,
                 COALESCE(kcm.line_start, 0), COALESCE(kcm.line_end, 0),
                 COALESCE(kcm.metadata, '{{}}'),
                 COALESCE(ks.label, '') as source_label,
@@ -303,14 +328,16 @@ fn knowledge_bm25_search(
         .query_map(param_refs.as_slice(), |row| {
             Ok(RankedResult {
                 rowid: row.get(0)?,
-                title: row.get(1)?,
-                content: row.get(2)?,
-                line_start: row.get::<_, i64>(3).unwrap_or(0) as u32,
-                line_end: row.get::<_, i64>(4).unwrap_or(0) as u32,
-                metadata: row.get(5)?,
-                source_label: row.get(6)?,
-                file_path: row.get(7)?,
-                rank: row.get::<_, f64>(8)?.abs(),
+                file_id: row.get(1)?,
+                source_id: row.get(2)?,
+                title: row.get(3)?,
+                content: row.get(4)?,
+                line_start: row.get::<_, i64>(5).unwrap_or(0) as u32,
+                line_end: row.get::<_, i64>(6).unwrap_or(0) as u32,
+                metadata: row.get(7)?,
+                source_label: row.get(8)?,
+                file_path: row.get(9)?,
+                rank: row.get::<_, f64>(10)?.abs(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -351,7 +378,7 @@ fn knowledge_trigram_search(
     };
 
     let sql = format!(
-        "SELECT kct.rowid, kct.title, kct.content,
+        "SELECT kct.rowid, kcm.file_id, kcm.source_id, kct.title, kct.content,
                 COALESCE(kcm.line_start, 0), COALESCE(kcm.line_end, 0),
                 COALESCE(kcm.metadata, '{{}}'),
                 COALESCE(ks.label, '') as source_label,
@@ -374,14 +401,16 @@ fn knowledge_trigram_search(
         .query_map(param_refs.as_slice(), |row| {
             Ok(RankedResult {
                 rowid: row.get(0)?,
-                title: row.get(1)?,
-                content: row.get(2)?,
-                line_start: row.get::<_, i64>(3).unwrap_or(0) as u32,
-                line_end: row.get::<_, i64>(4).unwrap_or(0) as u32,
-                metadata: row.get(5)?,
-                source_label: row.get(6)?,
-                file_path: row.get(7)?,
-                rank: row.get::<_, f64>(8)?.abs(),
+                file_id: row.get(1)?,
+                source_id: row.get(2)?,
+                title: row.get(3)?,
+                content: row.get(4)?,
+                line_start: row.get::<_, i64>(5).unwrap_or(0) as u32,
+                line_end: row.get::<_, i64>(6).unwrap_or(0) as u32,
+                metadata: row.get(7)?,
+                source_label: row.get(8)?,
+                file_path: row.get(9)?,
+                rank: row.get::<_, f64>(10)?.abs(),
             })
         })?
         .filter_map(|r| r.ok())
@@ -427,9 +456,8 @@ fn knowledge_fuzzy_search(
 
 /// Extract terms from the knowledge FTS5 vocab for fuzzy matching.
 fn extract_knowledge_terms(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    let result = conn.prepare(
-        "SELECT DISTINCT term FROM knowledge_chunks_vocab WHERE col = 'content' LIMIT ?1",
-    );
+    let result = conn
+        .prepare("SELECT DISTINCT term FROM knowledge_chunks_vocab WHERE col = 'content' LIMIT ?1");
 
     match result {
         Ok(mut stmt) => {
@@ -445,7 +473,7 @@ fn extract_knowledge_terms(conn: &Connection, limit: usize) -> Result<Vec<String
             // Vocab table may not exist; create it and retry
             let _ = conn.execute_batch(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_vocab \
-                 USING fts5vocab(knowledge_chunks, instance);"
+                 USING fts5vocab(knowledge_chunks, instance);",
             );
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT term FROM knowledge_chunks_vocab WHERE col = 'content' LIMIT ?1",
@@ -485,6 +513,7 @@ fn knowledge_vector_search(
 
     let mut sql = format!(
         "SELECT ke.chunk_rowid, ke.embedding,
+                kcm.file_id, kcm.source_id,
                 kc.title, kc.content,
                 COALESCE(kcm.line_start, 0), COALESCE(kcm.line_end, 0),
                 COALESCE(kcm.metadata, '{{}}'),
@@ -524,34 +553,40 @@ fn knowledge_vector_search(
             Ok((
                 blob,
                 chunk_rowid,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4).unwrap_or(0) as u32,
-                row.get::<_, i64>(5).unwrap_or(0) as u32,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6).unwrap_or(0) as u32,
+                row.get::<_, i64>(7).unwrap_or(0) as u32,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })?
         .filter_map(|r| r.ok())
-        .map(|(blob, rowid, title, content, ls, le, meta, source, path)| {
-            let embedding = embedder::bytes_to_embedding(&blob);
-            let similarity = dot_product(query_embedding, &embedding);
-            (
-                similarity,
-                RankedResult {
-                    rowid,
-                    title,
-                    content,
-                    rank: 0.0,
-                    source_label: source,
-                    file_path: path,
-                    line_start: ls,
-                    line_end: le,
-                    metadata: meta,
-                },
-            )
-        })
+        .map(
+            |(blob, rowid, file_id, source_id, title, content, ls, le, meta, source, path)| {
+                let embedding = embedder::bytes_to_embedding(&blob);
+                let similarity = dot_product(query_embedding, &embedding);
+                (
+                    similarity,
+                    RankedResult {
+                        rowid,
+                        file_id,
+                        source_id,
+                        title,
+                        content,
+                        rank: 0.0,
+                        source_label: source,
+                        file_path: path,
+                        line_start: ls,
+                        line_end: le,
+                        metadata: meta,
+                    },
+                )
+            },
+        )
         .collect();
 
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -574,6 +609,7 @@ fn merge_results(
     acc: &mut HashMap<i64, ScoredResult>,
     results: &[RankedResult],
     weight: f64,
+    layer: &str,
 ) {
     const K: f64 = 60.0;
 
@@ -583,8 +619,17 @@ fn merge_results(
         acc.entry(result.rowid)
             .and_modify(|sr| {
                 sr.rrf_score += rrf_score;
+                match layer {
+                    "bm25" => sr.why.layers.bm25 += rrf_score,
+                    "trigram" => sr.why.layers.trigram += rrf_score,
+                    "fuzzy" => sr.why.layers.fuzzy += rrf_score,
+                    "vector" => sr.why.layers.vector += rrf_score,
+                    _ => {}
+                }
             })
             .or_insert_with(|| ScoredResult {
+                file_id: result.file_id,
+                source_id: result.source_id,
                 title: result.title.clone(),
                 content: result.content.clone(),
                 source_label: result.source_label.clone(),
@@ -593,6 +638,17 @@ fn merge_results(
                 line_end: result.line_end,
                 metadata: result.metadata.clone(),
                 rrf_score,
+                why: {
+                    let mut why = SearchWhy::default();
+                    match layer {
+                        "bm25" => why.layers.bm25 = rrf_score,
+                        "trigram" => why.layers.trigram = rrf_score,
+                        "fuzzy" => why.layers.fuzzy = rrf_score,
+                        "vector" => why.layers.vector = rrf_score,
+                        _ => {}
+                    }
+                    why
+                },
             });
     }
 }
@@ -623,9 +679,12 @@ fn session_to_knowledge_result(sr: SearchResult, snippet_bytes: usize) -> Knowle
         score: sr.score,
         source_label: sr.source.clone(),
         file_path: sr.source,
+        file_id: 0,
+        source_id: sr.source_id,
         lines: format!("{}-{}", sr.line_start, sr.line_end),
         metadata: serde_json::Value::Object(Default::default()),
         source_type: "session".to_string(),
+        why: sr.why,
     }
 }
 
@@ -776,8 +835,7 @@ mod tests {
     fn search_empty_db_returns_empty() {
         let store = make_store();
         let weights = SearchWeights::default();
-        let results =
-            knowledge_search(&store, "anything", None, None, 10, &weights, 2000).unwrap();
+        let results = knowledge_search(&store, "anything", None, None, 10, &weights, 2000).unwrap();
         assert!(results.is_empty());
     }
 
@@ -817,8 +875,7 @@ mod tests {
         );
 
         let weights = SearchWeights::default();
-        let results =
-            knowledge_search(&store, "content", None, None, 10, &weights, 2000).unwrap();
+        let results = knowledge_search(&store, "content", None, None, 10, &weights, 2000).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].lines, "1-20");
     }
@@ -1043,8 +1100,7 @@ mod tests {
         // (knowledge portion returns empty)
         let store = make_store();
         let weights = SearchWeights::default();
-        let results =
-            knowledge_search(&store, "anything", None, None, 10, &weights, 2000).unwrap();
+        let results = knowledge_search(&store, "anything", None, None, 10, &weights, 2000).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1065,8 +1121,7 @@ mod tests {
         );
 
         let weights = SearchWeights::default();
-        let results =
-            knowledge_search(&store, "word", None, None, 10, &weights, 100).unwrap();
+        let results = knowledge_search(&store, "word", None, None, 10, &weights, 100).unwrap();
         assert!(!results.is_empty());
         assert!(results[0].snippet.len() <= 104); // 100 + "..."
     }

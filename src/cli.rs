@@ -50,6 +50,15 @@ pub enum Commands {
         /// Max results
         #[arg(short, long, default_value = "15")]
         limit: u32,
+        /// Retrieval profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Show full ranking explanations
+        #[arg(long)]
+        explain: bool,
+        /// Disable learned search memory reuse
+        #[arg(long = "no-memory")]
+        no_memory: bool,
     },
 
     /// Index raw text
@@ -152,6 +161,15 @@ pub enum KnowledgeAction {
         /// Max results
         #[arg(long, default_value = "10")]
         limit: u32,
+        /// Retrieval profile
+        #[arg(long)]
+        profile: Option<String>,
+        /// Show full ranking explanations
+        #[arg(long)]
+        explain: bool,
+        /// Disable learned search memory reuse
+        #[arg(long = "no-memory")]
+        no_memory: bool,
     },
     /// Show knowledge source status
     Status,

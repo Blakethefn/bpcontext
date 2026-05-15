@@ -122,7 +122,11 @@ pub fn extract_wikilinks(content: &str) -> Value {
             if let Some(end_offset) = content[start..].find("]]") {
                 let link_content = &content[start..start + end_offset];
                 // Extract target (before | if alias exists)
-                let target = link_content.split('|').next().unwrap_or(link_content).trim();
+                let target = link_content
+                    .split('|')
+                    .next()
+                    .unwrap_or(link_content)
+                    .trim();
                 if !target.is_empty() && seen.insert(target.to_string()) {
                     links.push(Value::String(target.to_string()));
                 }
@@ -365,8 +369,8 @@ mod tests {
             "wikilinks".to_string(),
             "folder_tags".to_string(),
         ];
-        let func = build_enrichment_fn(&enrichments, Path::new("/vault"))
-            .expect("should return Some");
+        let func =
+            build_enrichment_fn(&enrichments, Path::new("/vault")).expect("should return Some");
 
         let content = "---\ntype: task\n---\nSee [[other]]";
         let path = Path::new("/vault/01-projects/note.md");
@@ -385,8 +389,8 @@ mod tests {
     #[test]
     fn build_frontmatter_only() {
         let enrichments = vec!["frontmatter".to_string()];
-        let func = build_enrichment_fn(&enrichments, Path::new("/base"))
-            .expect("should return Some");
+        let func =
+            build_enrichment_fn(&enrichments, Path::new("/base")).expect("should return Some");
 
         let content = "---\nstatus: done\n---\nBody";
         let result = func(content, Path::new("/base/file.md"));
@@ -400,8 +404,8 @@ mod tests {
     #[test]
     fn build_wikilinks_only() {
         let enrichments = vec!["wikilinks".to_string()];
-        let func = build_enrichment_fn(&enrichments, Path::new("/base"))
-            .expect("should return Some");
+        let func =
+            build_enrichment_fn(&enrichments, Path::new("/base")).expect("should return Some");
 
         let content = "Link to [[target]]";
         let result = func(content, Path::new("/base/file.md"));
@@ -415,8 +419,8 @@ mod tests {
     #[test]
     fn build_folder_tags_only() {
         let enrichments = vec!["folder_tags".to_string()];
-        let func = build_enrichment_fn(&enrichments, Path::new("/vault"))
-            .expect("should return Some");
+        let func =
+            build_enrichment_fn(&enrichments, Path::new("/vault")).expect("should return Some");
 
         let content = "No links, no frontmatter";
         let result = func(content, Path::new("/vault/deep/path/file.md"));
@@ -431,12 +435,9 @@ mod tests {
     #[test]
     fn build_unknown_enrichment_ignored() {
         // Unknown enrichments are ignored; valid ones still work
-        let enrichments = vec![
-            "frontmatter".to_string(),
-            "nonexistent".to_string(),
-        ];
-        let func = build_enrichment_fn(&enrichments, Path::new("/base"))
-            .expect("should return Some");
+        let enrichments = vec!["frontmatter".to_string(), "nonexistent".to_string()];
+        let func =
+            build_enrichment_fn(&enrichments, Path::new("/base")).expect("should return Some");
 
         let content = "---\ntype: test\n---\nBody";
         let result = func(content, Path::new("/base/file.md"));
@@ -466,8 +467,8 @@ mod tests {
             "wikilinks".to_string(),
             "folder_tags".to_string(),
         ];
-        let func = build_enrichment_fn(&enrichments, Path::new("/vault"))
-            .expect("should return Some");
+        let func =
+            build_enrichment_fn(&enrichments, Path::new("/vault")).expect("should return Some");
 
         let content = "Plain text, no frontmatter, no links";
         let path = Path::new("/vault/root.md");

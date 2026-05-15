@@ -672,20 +672,11 @@ mod tests {
 
         let enrichments = vec!["frontmatter".to_string()];
         store
-            .add_source(
-                "test",
-                dir.path().to_str().unwrap(),
-                None,
-                &enrichments,
-            )
+            .add_source("test", dir.path().to_str().unwrap(), None, &enrichments)
             .unwrap();
 
         let file = dir.path().join("enriched.md");
-        fs::write(
-            &file,
-            "---\ntype: task\nstatus: active\n---\n# Task\nBody",
-        )
-        .unwrap();
+        fs::write(&file, "---\ntype: task\nstatus: active\n---\n# Task\nBody").unwrap();
 
         let count = write_through_inner(&[file], &store);
         assert_eq!(count, 1);

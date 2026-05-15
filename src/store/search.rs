@@ -3,6 +3,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 
 use crate::embedder::{self, Embed};
+use crate::search_model::SearchWhy;
 
 /// A search result with relevance metadata
 #[derive(Debug, Clone)]
@@ -16,6 +17,8 @@ pub struct SearchResult {
     pub source: String,
     pub line_start: u32,
     pub line_end: u32,
+    pub rowid: Option<i64>,
+    pub why: SearchWhy,
 }
 
 /// Weight configuration for RRF layer blending
@@ -55,7 +58,12 @@ pub fn multi_layer_search(
         source_id_filter,
         type_filter,
     )?;
-    merge_results(&mut all_results, &bm25_results, weights.keyword_weight);
+    merge_results(
+        &mut all_results,
+        &bm25_results,
+        weights.keyword_weight,
+        "bm25",
+    );
 
     // Layer 2: Trigram search (if BM25 returned fewer than limit)
     if bm25_results.len() < limit as usize {
@@ -67,7 +75,12 @@ pub fn multi_layer_search(
             source_id_filter,
             type_filter,
         )?;
-        merge_results(&mut all_results, &trigram_results, weights.keyword_weight);
+        merge_results(
+            &mut all_results,
+            &trigram_results,
+            weights.keyword_weight,
+            "trigram",
+        );
     }
 
     // Layer 3: Levenshtein fuzzy correction (if still too few results)
@@ -80,7 +93,12 @@ pub fn multi_layer_search(
             source_id_filter,
             type_filter,
         )?;
-        merge_results(&mut all_results, &fuzzy_results, weights.keyword_weight);
+        merge_results(
+            &mut all_results,
+            &fuzzy_results,
+            weights.keyword_weight,
+            "fuzzy",
+        );
     }
 
     // Layer 4: Vector similarity (always runs if embedder available)
@@ -88,10 +106,8 @@ pub fn multi_layer_search(
     if let Some(emb) = embedder {
         match emb.embed_one(query) {
             Ok(query_embedding) => {
-                let candidate_rowids: Vec<i64> = all_results
-                    .values()
-                    .filter_map(|sr| sr.rowid)
-                    .collect();
+                let candidate_rowids: Vec<i64> =
+                    all_results.values().filter_map(|sr| sr.rowid).collect();
                 let candidates = if candidate_rowids.is_empty() {
                     None // No keyword results — fall back to full search
                 } else {
@@ -107,7 +123,12 @@ pub fn multi_layer_search(
                     type_filter,
                     candidates,
                 )?;
-                merge_results(&mut all_results, &vector_results, weights.vector_weight);
+                merge_results(
+                    &mut all_results,
+                    &vector_results,
+                    weights.vector_weight,
+                    "vector",
+                );
             }
             Err(e) => {
                 eprintln!("[bpcontext] query embedding failed, skipping vector layer: {e}");
@@ -243,7 +264,10 @@ fn trigram_search(
         params.push(Box::new(format!("%{sf}%")));
     }
     if let Some(sid) = source_id_filter {
-        sql.push_str(&format!(" AND chunks_trigram.source_id = ?{}", params.len() + 1));
+        sql.push_str(&format!(
+            " AND chunks_trigram.source_id = ?{}",
+            params.len() + 1
+        ));
         params.push(Box::new(sid));
     }
 
@@ -459,7 +483,12 @@ fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
 /// Merge ranked results into the accumulator using Reciprocal Rank Fusion.
 /// The `weight` multiplier scales the RRF contribution of this layer.
-fn merge_results(acc: &mut HashMap<(i64, String), ScoredResult>, results: &[RankedResult], weight: f64) {
+fn merge_results(
+    acc: &mut HashMap<(i64, String), ScoredResult>,
+    results: &[RankedResult],
+    weight: f64,
+    layer: &str,
+) {
     const K: f64 = 60.0;
 
     for (rank, result) in results.iter().enumerate() {
@@ -469,6 +498,7 @@ fn merge_results(acc: &mut HashMap<(i64, String), ScoredResult>, results: &[Rank
         acc.entry(key)
             .and_modify(|sr| {
                 sr.rrf_score += rrf_score;
+                sr.add_layer_score(layer, rrf_score);
                 // Keep the first non-None rowid we see
                 if sr.rowid.is_none() {
                     sr.rowid = result.rowid;
@@ -484,6 +514,17 @@ fn merge_results(acc: &mut HashMap<(i64, String), ScoredResult>, results: &[Rank
                 line_start: result.line_start,
                 line_end: result.line_end,
                 rowid: result.rowid,
+                why: {
+                    let mut why = SearchWhy::default();
+                    match layer {
+                        "bm25" => why.layers.bm25 = rrf_score,
+                        "trigram" => why.layers.trigram = rrf_score,
+                        "fuzzy" => why.layers.fuzzy = rrf_score,
+                        "vector" => why.layers.vector = rrf_score,
+                        _ => {}
+                    }
+                    why
+                },
             });
     }
 }
@@ -513,9 +554,13 @@ fn apply_proximity_boost(results: &mut [SearchResult], query: &str) {
         if all_found && positions.len() >= 2 {
             let span = positions.iter().max().unwrap() - positions.iter().min().unwrap();
             if span < 200 {
-                result.score *= 1.5; // 50% boost for proximity
+                let boosted = result.score * 1.5;
+                result.why.layers.proximity += boosted - result.score;
+                result.score = boosted; // 50% boost for proximity
             } else if span < 500 {
-                result.score *= 1.2; // 20% boost for moderate proximity
+                let boosted = result.score * 1.2;
+                result.why.layers.proximity += boosted - result.score;
+                result.score = boosted; // 20% boost for moderate proximity
             }
         }
     }
@@ -577,9 +622,20 @@ struct ScoredResult {
     line_start: u32,
     line_end: u32,
     rowid: Option<i64>,
+    why: SearchWhy,
 }
 
 impl ScoredResult {
+    fn add_layer_score(&mut self, layer: &str, score: f64) {
+        match layer {
+            "bm25" => self.why.layers.bm25 += score,
+            "trigram" => self.why.layers.trigram += score,
+            "fuzzy" => self.why.layers.fuzzy += score,
+            "vector" => self.why.layers.vector += score,
+            _ => {}
+        }
+    }
+
     fn into_search_result(self) -> SearchResult {
         SearchResult {
             title: self.title,
@@ -590,6 +646,8 @@ impl ScoredResult {
             source: self.source_label,
             line_start: self.line_start,
             line_end: self.line_end,
+            rowid: self.rowid,
+            why: self.why,
         }
     }
 }
@@ -662,11 +720,11 @@ mod tests {
         }];
 
         // Weight 1.0: rank 0 → 1/(60+0+1) = 0.01639...
-        merge_results(&mut acc, &results, 1.0);
+        merge_results(&mut acc, &results, 1.0, "bm25");
         let score_w1 = acc.values().next().unwrap().rrf_score;
 
         let mut acc2: HashMap<(i64, String), ScoredResult> = HashMap::new();
-        merge_results(&mut acc2, &results, 2.0);
+        merge_results(&mut acc2, &results, 2.0, "bm25");
         let score_w2 = acc2.values().next().unwrap().rrf_score;
 
         assert!((score_w2 - 2.0 * score_w1).abs() < 1e-10);
@@ -796,7 +854,8 @@ mod tests {
         let query_emb = test_embedding("anything");
 
         // Filter by existing type
-        let results = vector_search(&conn, &query_emb, 10, None, None, Some("prose"), None).unwrap();
+        let results =
+            vector_search(&conn, &query_emb, 10, None, None, Some("prose"), None).unwrap();
         assert!(!results.is_empty());
 
         // Filter by non-existing type
@@ -839,26 +898,16 @@ mod tests {
         let conn = setup_vector_test_db();
 
         // A source filter containing a single quote should not cause an SQL error
-        let results = fts5_bm25_search(
-            &conn,
-            "authentication",
-            10,
-            Some("it's a test"),
-            None,
-            None,
+        let results =
+            fts5_bm25_search(&conn, "authentication", 10, Some("it's a test"), None, None);
+        assert!(
+            results.is_ok(),
+            "single quote in source_filter should not error"
         );
-        assert!(results.is_ok(), "single quote in source_filter should not error");
         assert!(results.unwrap().is_empty(), "no source matches so empty");
 
         // A type filter containing a percent sign should not cause an SQL error
-        let results = fts5_bm25_search(
-            &conn,
-            "authentication",
-            10,
-            None,
-            None,
-            Some("100%done"),
-        );
+        let results = fts5_bm25_search(&conn, "authentication", 10, None, None, Some("100%done"));
         assert!(results.is_ok(), "percent in type_filter should not error");
         assert!(results.unwrap().is_empty(), "no type matches so empty");
 
@@ -871,7 +920,10 @@ mod tests {
             None,
             None,
         );
-        assert!(results.is_ok(), "single quote in trigram source_filter should not error");
+        assert!(
+            results.is_ok(),
+            "single quote in trigram source_filter should not error"
+        );
         assert!(results.unwrap().is_empty());
 
         // And vector_search
@@ -885,7 +937,10 @@ mod tests {
             Some("100%done"),
             None,
         );
-        assert!(results.is_ok(), "special chars in vector_search filters should not error");
+        assert!(
+            results.is_ok(),
+            "special chars in vector_search filters should not error"
+        );
         assert!(results.unwrap().is_empty());
     }
 
@@ -966,12 +1021,13 @@ mod tests {
         let query_emb = test_embedding("authentication login JWT");
 
         // Get all chunk rowids to pick specific ones
-        let all_results =
-            vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
+        let all_results = vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
         assert_eq!(all_results.len(), 3, "should have 3 chunks total");
 
         // Extract rowid of just the first result
-        let first_rowid = all_results[0].rowid.expect("vector_search should set rowid");
+        let first_rowid = all_results[0]
+            .rowid
+            .expect("vector_search should set rowid");
         let candidate_rowids = vec![first_rowid];
 
         let filtered_results = vector_search(
@@ -998,8 +1054,7 @@ mod tests {
         let query_emb = test_embedding("anything");
 
         // None means no pre-filter — should return all chunks
-        let results =
-            vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
+        let results = vector_search(&conn, &query_emb, 10, None, None, None, None).unwrap();
         assert_eq!(results.len(), 3, "None candidates should search all chunks");
 
         // Empty slice should also search all (no IN clause added)

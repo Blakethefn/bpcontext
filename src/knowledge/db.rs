@@ -9,6 +9,7 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 use crate::db::{data_dir, open_db};
+use crate::search_memory;
 
 /// Returns the path to the knowledge database.
 /// `~/.local/share/bpcontext/knowledge.db`
@@ -103,5 +104,6 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_links_target ON knowledge_links(target_file_id);
         ",
     )?;
+    search_memory::init_knowledge_schema(conn)?;
     Ok(())
 }

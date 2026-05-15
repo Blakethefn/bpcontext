@@ -60,8 +60,8 @@ pub fn sync_source(
     let mut unchanged: usize = 0;
 
     for (rel_path, abs_path) in &disk_files {
-        let bytes = fs::read(abs_path)
-            .with_context(|| format!("failed to read {}", abs_path.display()))?;
+        let bytes =
+            fs::read(abs_path).with_context(|| format!("failed to read {}", abs_path.display()))?;
 
         // Skip non-UTF-8 files silently
         let content = match String::from_utf8(bytes) {
@@ -99,7 +99,10 @@ pub fn sync_source(
         // 4a. Remove deleted files
         for file_id in &to_remove {
             delete_file_chunks(conn, *file_id)?;
-            conn.execute("DELETE FROM knowledge_files WHERE id = ?1", params![file_id])?;
+            conn.execute(
+                "DELETE FROM knowledge_files WHERE id = ?1",
+                params![file_id],
+            )?;
         }
 
         // 4b. Update changed files (delete old chunks, re-index)
@@ -375,9 +378,8 @@ fn load_db_files(
     conn: &rusqlite::Connection,
     source_id: i64,
 ) -> Result<HashMap<String, (i64, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, rel_path, content_hash FROM knowledge_files WHERE source_id = ?1",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT id, rel_path, content_hash FROM knowledge_files WHERE source_id = ?1")?;
     let mut files = HashMap::new();
     let rows = stmt.query_map(params![source_id], |row| {
         Ok((
@@ -553,10 +555,7 @@ fn resolve_wikilink(target: &str, files: &HashMap<String, i64>) -> Option<i64> {
 /// metadata. Runs inside the sync transaction after all files are indexed.
 ///
 /// Returns the number of links created.
-fn resolve_wikilinks_for_source(
-    conn: &rusqlite::Connection,
-    source_id: i64,
-) -> Result<usize> {
+fn resolve_wikilinks_for_source(conn: &rusqlite::Connection, source_id: i64) -> Result<usize> {
     // Delete existing links for this source's files
     conn.execute(
         "DELETE FROM knowledge_links WHERE source_file_id IN
@@ -566,9 +565,8 @@ fn resolve_wikilinks_for_source(
 
     // Load all file rel_paths → IDs for this source
     let files: HashMap<String, i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, rel_path FROM knowledge_files WHERE source_id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, rel_path FROM knowledge_files WHERE source_id = ?1")?;
         let rows = stmt.query_map(params![source_id], |row| {
             Ok((row.get::<_, String>(1)?, row.get::<_, i64>(0)?))
         })?;
@@ -662,11 +660,7 @@ mod tests {
         store.get_source("test").unwrap().unwrap()
     }
 
-    fn register_source_glob(
-        store: &KnowledgeStore,
-        dir: &Path,
-        glob: &str,
-    ) -> KnowledgeSourceInfo {
+    fn register_source_glob(store: &KnowledgeStore, dir: &Path, glob: &str) -> KnowledgeSourceInfo {
         store
             .add_source("test", dir.to_str().unwrap(), Some(glob), &[])
             .unwrap();
@@ -724,11 +718,7 @@ mod tests {
         let store = make_store();
         let dir = tempdir().unwrap();
         for i in 0..5 {
-            fs::write(
-                dir.path().join(format!("f{i}.md")),
-                format!("# F{i}\nBody"),
-            )
-            .unwrap();
+            fs::write(dir.path().join(format!("f{i}.md")), format!("# F{i}\nBody")).unwrap();
         }
         let source = register_source(&store, dir.path());
         sync_source(&store, &source, None).unwrap();
@@ -905,11 +895,9 @@ mod tests {
 
         let count: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_embeddings",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_embeddings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert!(count > 0, "embeddings should be generated");
     }
@@ -926,11 +914,9 @@ mod tests {
         assert_eq!(result.files_added, 1);
         let embed_count: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_embeddings",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_embeddings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(embed_count, 0, "no embeddings without embedder");
     }
@@ -967,19 +953,15 @@ mod tests {
         // Chunk count in knowledge_chunks matches chunk_meta count
         let fts_count: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_chunks",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_chunks", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let meta_count: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_chunk_meta",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_chunk_meta", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(fts_count, meta_count, "FTS5 and meta counts should match");
     }
@@ -1077,15 +1059,18 @@ mod tests {
 
     #[test]
     fn resolve_exact_path() {
-        let files: HashMap<String, i64> =
-            [("01-projects/bpcontext.md".into(), 1)].into_iter().collect();
-        assert_eq!(resolve_wikilink("01-projects/bpcontext.md", &files), Some(1));
+        let files: HashMap<String, i64> = [("01-projects/bpcontext.md".into(), 1)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            resolve_wikilink("01-projects/bpcontext.md", &files),
+            Some(1)
+        );
     }
 
     #[test]
     fn resolve_appends_md_extension() {
-        let files: HashMap<String, i64> =
-            [("notes/idea.md".into(), 2)].into_iter().collect();
+        let files: HashMap<String, i64> = [("notes/idea.md".into(), 2)].into_iter().collect();
         assert_eq!(resolve_wikilink("notes/idea", &files), Some(2));
     }
 
@@ -1098,15 +1083,13 @@ mod tests {
 
     #[test]
     fn resolve_basename_without_extension() {
-        let files: HashMap<String, i64> =
-            [("folder/config".into(), 4)].into_iter().collect();
+        let files: HashMap<String, i64> = [("folder/config".into(), 4)].into_iter().collect();
         assert_eq!(resolve_wikilink("config", &files), Some(4));
     }
 
     #[test]
     fn resolve_returns_none_for_missing() {
-        let files: HashMap<String, i64> =
-            [("a.md".into(), 1)].into_iter().collect();
+        let files: HashMap<String, i64> = [("a.md".into(), 1)].into_iter().collect();
         assert_eq!(resolve_wikilink("nonexistent", &files), None);
     }
 
@@ -1132,18 +1115,17 @@ mod tests {
     fn sync_creates_wikilink_edges() {
         let store = make_store();
         let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("a.md"),
-            "---\ntype: note\n---\nSee [[b]]",
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.md"), "---\ntype: note\n---\nSee [[b]]").unwrap();
         fs::write(dir.path().join("b.md"), "# B\nTarget note").unwrap();
 
-        let source =
-            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
-        let enrich_fn =
-            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
-        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        let source = register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn = super::super::enrichment::build_enrichment_fn(
+            &source.enrichments,
+            Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
         let result = sync_source(&store, &source, enrich_ref).unwrap();
 
         assert!(result.links_created > 0, "should create wikilink edges");
@@ -1157,14 +1139,21 @@ mod tests {
         // File links to itself
         fs::write(dir.path().join("self.md"), "See [[self]]").unwrap();
 
-        let source =
-            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
-        let enrich_fn =
-            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
-        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        let source = register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn = super::super::enrichment::build_enrichment_fn(
+            &source.enrichments,
+            Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
         sync_source(&store, &source, enrich_ref).unwrap();
 
-        assert_eq!(link_count(&store, source.id), 0, "self-links should be skipped");
+        assert_eq!(
+            link_count(&store, source.id),
+            0,
+            "self-links should be skipped"
+        );
     }
 
     #[test]
@@ -1173,11 +1162,14 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("a.md"), "Link to [[nonexistent]]").unwrap();
 
-        let source =
-            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
-        let enrich_fn =
-            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
-        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        let source = register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn = super::super::enrichment::build_enrichment_fn(
+            &source.enrichments,
+            Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
         sync_source(&store, &source, enrich_ref).unwrap();
 
         assert_eq!(link_count(&store, source.id), 0);
@@ -1191,20 +1183,27 @@ mod tests {
         fs::write(dir.path().join("b.md"), "# B").unwrap();
         fs::write(dir.path().join("c.md"), "# C").unwrap();
 
-        let source =
-            register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
-        let enrich_fn =
-            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
-        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        let source = register_source_with_enrichments(&store, dir.path(), &["wikilinks"]);
+        let enrich_fn = super::super::enrichment::build_enrichment_fn(
+            &source.enrichments,
+            Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
         sync_source(&store, &source, enrich_ref).unwrap();
         assert_eq!(link_count(&store, source.id), 1, "a→b");
 
         // Change a.md to link to c instead
         fs::write(dir.path().join("a.md"), "See [[c]]").unwrap();
         let source = store.get_source("test").unwrap().unwrap();
-        let enrich_fn =
-            super::super::enrichment::build_enrichment_fn(&source.enrichments, Path::new(&source.path));
-        let enrich_ref = enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
+        let enrich_fn = super::super::enrichment::build_enrichment_fn(
+            &source.enrichments,
+            Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &Path) -> serde_json::Value);
         sync_source(&store, &source, enrich_ref).unwrap();
 
         // Old a→b link should be gone, new a→c should exist
@@ -1221,6 +1220,10 @@ mod tests {
         let source = register_source(&store, dir.path());
         sync_source(&store, &source, None).unwrap();
 
-        assert_eq!(link_count(&store, source.id), 0, "no enrichments = no links");
+        assert_eq!(
+            link_count(&store, source.id),
+            0,
+            "no enrichments = no links"
+        );
     }
 }

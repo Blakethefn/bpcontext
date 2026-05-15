@@ -166,9 +166,9 @@ impl KnowledgeStore {
 
         // Collect chunk rowids before any deletions so we still have references.
         let chunk_rowids: Vec<i64> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT chunk_rowid FROM knowledge_chunk_meta WHERE source_id = ?1",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT chunk_rowid FROM knowledge_chunk_meta WHERE source_id = ?1")?;
             let rows = stmt.query_map(rusqlite::params![source_id], |row| row.get(0))?;
             rows.filter_map(|r| r.ok()).collect()
         };
@@ -409,11 +409,7 @@ impl KnowledgeStore {
     }
 
     /// Get linked file_ids for BFS frontier expansion (no content fetched).
-    fn get_linked_file_ids(
-        &self,
-        file_id: i64,
-        direction: LinkDirection,
-    ) -> Result<Vec<i64>> {
+    fn get_linked_file_ids(&self, file_id: i64, direction: LinkDirection) -> Result<Vec<i64>> {
         let mut ids = Vec::new();
 
         if matches!(direction, LinkDirection::Forward | LinkDirection::Both) {
@@ -478,12 +474,8 @@ impl KnowledgeStore {
                     break;
                 }
 
-                let mut chunks = self.get_related_chunks_filtered(
-                    fid,
-                    direction,
-                    remaining,
-                    filter_predicates,
-                )?;
+                let mut chunks =
+                    self.get_related_chunks_filtered(fid, direction, remaining, filter_predicates)?;
 
                 // Collect new file_ids for next hop's frontier
                 let linked_ids = self.get_linked_file_ids(fid, direction)?;
@@ -771,9 +763,7 @@ mod tests {
     #[test]
     fn list_sources_returns_added() {
         let store = make_store();
-        store
-            .add_source("alpha", "/tmp/alpha", None, &[])
-            .unwrap();
+        store.add_source("alpha", "/tmp/alpha", None, &[]).unwrap();
         store
             .add_source("beta", "/tmp/beta", Some("**/*.md"), &[])
             .unwrap();
@@ -814,9 +804,7 @@ mod tests {
     #[test]
     fn remove_source_deletes_record() {
         let store = make_store();
-        store
-            .add_source("gone", "/tmp/gone", None, &[])
-            .unwrap();
+        store.add_source("gone", "/tmp/gone", None, &[]).unwrap();
         store.remove_source("gone").expect("remove");
         assert!(store.get_source("gone").unwrap().is_none());
     }
@@ -824,9 +812,7 @@ mod tests {
     #[test]
     fn remove_source_returns_zero_counts_when_no_files() {
         let store = make_store();
-        store
-            .add_source("empty", "/tmp/empty", None, &[])
-            .unwrap();
+        store.add_source("empty", "/tmp/empty", None, &[]).unwrap();
         let result = store.remove_source("empty").unwrap();
         assert_eq!(result.files_removed, 0);
         assert_eq!(result.chunks_removed, 0);
@@ -843,9 +829,7 @@ mod tests {
     #[test]
     fn source_for_path_matches_registered_source() {
         let store = make_store();
-        store
-            .add_source("docs", "/tmp/docs", None, &[])
-            .unwrap();
+        store.add_source("docs", "/tmp/docs", None, &[]).unwrap();
         let found = store
             .source_for_path(Path::new("/tmp/docs/foo.md"))
             .unwrap();
@@ -856,9 +840,7 @@ mod tests {
     #[test]
     fn source_for_path_no_match_returns_none() {
         let store = make_store();
-        store
-            .add_source("docs", "/tmp/docs", None, &[])
-            .unwrap();
+        store.add_source("docs", "/tmp/docs", None, &[]).unwrap();
         let found = store
             .source_for_path(Path::new("/other/path/file.md"))
             .unwrap();
@@ -1128,16 +1110,9 @@ mod integration_tests {
         assert_eq!(results[0].metadata["frontmatter"]["status"], "active");
 
         // No filter → should find all three
-        let results = search::knowledge_search(
-            &store,
-            "prediction engine",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "prediction engine", None, None, 10, &weights, 2000)
+                .unwrap();
         assert_eq!(
             results.len(),
             3,
@@ -1220,16 +1195,9 @@ mod integration_tests {
 
         // Verify original content is searchable
         let weights = SearchWeights::default();
-        let results = search::knowledge_search(
-            &store,
-            "quasar protocol",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "quasar protocol", None, None, 10, &weights, 2000)
+                .unwrap();
         assert!(!results.is_empty(), "original content should be searchable");
 
         // Edit the file (simulating Edit tool)
@@ -1243,32 +1211,18 @@ mod integration_tests {
         sync::reindex_file(&store, &source, &file_path, None).unwrap();
 
         // New content is searchable
-        let results = search::knowledge_search(
-            &store,
-            "nebula framework",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "nebula framework", None, None, 10, &weights, 2000)
+                .unwrap();
         assert!(
             !results.is_empty(),
             "updated content should be searchable after reindex"
         );
 
         // Old content is no longer present
-        let results = search::knowledge_search(
-            &store,
-            "quasar protocol",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "quasar protocol", None, None, 10, &weights, 2000)
+                .unwrap();
         assert!(
             results.is_empty(),
             "old content should be gone after reindex"
@@ -1311,13 +1265,14 @@ mod integration_tests {
 
         let embed_count_before: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_embeddings",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_embeddings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert!(embed_count_before > 0, "embeddings should exist before removal");
+        assert!(
+            embed_count_before > 0,
+            "embeddings should exist before removal"
+        );
 
         // Remove the source
         let result = store.remove_source("doomed").unwrap();
@@ -1327,61 +1282,47 @@ mod integration_tests {
         // Verify zero orphans in every table
         let orphaned_files: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_files",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_files", [], |row| row.get(0))
             .unwrap();
         assert_eq!(orphaned_files, 0, "no files should remain");
 
         let orphaned_chunks: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_chunks",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_chunks", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(orphaned_chunks, 0, "no FTS5 chunks should remain");
 
         let orphaned_trigram: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_chunks_trigram",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_chunks_trigram", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(orphaned_trigram, 0, "no trigram chunks should remain");
 
         let orphaned_meta: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_chunk_meta",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_chunk_meta", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(orphaned_meta, 0, "no chunk_meta should remain");
 
         let orphaned_embeds: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_embeddings",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_embeddings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(orphaned_embeds, 0, "no embeddings should remain");
 
         let orphaned_sources: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_sources",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_sources", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(orphaned_sources, 0, "no sources should remain");
     }
@@ -1446,16 +1387,9 @@ mod integration_tests {
     fn empty_knowledge_search_returns_empty() {
         let store = make_store();
         let weights = SearchWeights::default();
-        let results = search::knowledge_search(
-            &store,
-            "anything at all",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "anything at all", None, None, 10, &weights, 2000)
+                .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1565,9 +1499,7 @@ mod integration_tests {
         // Verify wikilinks extracted correctly
         let wikilinks = metadata["wikilinks"].as_array().unwrap();
         assert!(
-            wikilinks
-                .iter()
-                .any(|l| l.as_str() == Some("other-note")),
+            wikilinks.iter().any(|l| l.as_str() == Some("other-note")),
             "wikilinks should contain 'other-note'"
         );
 
@@ -1610,16 +1542,9 @@ mod integration_tests {
         sync::sync_source(&store, &source, enrich_ref).unwrap();
 
         let weights = SearchWeights::default();
-        let results = search::knowledge_search(
-            &store,
-            "crystallography",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "crystallography", None, None, 10, &weights, 2000)
+                .unwrap();
         assert!(
             !results.is_empty(),
             "file without frontmatter should still be searchable by content"
@@ -1650,28 +1575,16 @@ mod integration_tests {
         .unwrap();
 
         store
-            .add_source(
-                "md-only",
-                dir.path().to_str().unwrap(),
-                Some("*.md"),
-                &[],
-            )
+            .add_source("md-only", dir.path().to_str().unwrap(), Some("*.md"), &[])
             .unwrap();
         let source = store.get_source("md-only").unwrap().unwrap();
         let r = sync::sync_source(&store, &source, None).unwrap();
         assert_eq!(r.files_added, 1, "only .md files should be synced");
 
         let weights = SearchWeights::default();
-        let results = search::knowledge_search(
-            &store,
-            "photosynthesis",
-            None,
-            None,
-            10,
-            &weights,
-            2000,
-        )
-        .unwrap();
+        let results =
+            search::knowledge_search(&store, "photosynthesis", None, None, 10, &weights, 2000)
+                .unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1723,7 +1636,11 @@ mod integration_tests {
             2000,
         )
         .unwrap();
-        assert_eq!(results.len(), 2, "unfiltered should return from both sources");
+        assert_eq!(
+            results.len(),
+            2,
+            "unfiltered should return from both sources"
+        );
 
         // Source filter → only vault
         let results = search::knowledge_search(
@@ -1899,7 +1816,10 @@ mod integration_tests {
             2000,
         )
         .unwrap();
-        assert!(results.is_empty(), "type:task should no longer match after status change");
+        assert!(
+            results.is_empty(),
+            "type:task should no longer match after status change"
+        );
 
         // New filter should match
         let results = search::knowledge_search(
@@ -1932,7 +1852,10 @@ mod integration_tests {
 
         // Sync should error but not panic
         let result = sync::sync_source(&store, &source, None);
-        assert!(result.is_err(), "sync should error when source path is gone");
+        assert!(
+            result.is_err(),
+            "sync should error when source path is gone"
+        );
     }
 
     // ── Sync with embedder generates searchable vectors ────────────────────
@@ -1956,22 +1879,21 @@ mod integration_tests {
 
         let embed_count: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_embeddings",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_embeddings", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert!(embed_count > 0, "embeddings should be generated during sync");
+        assert!(
+            embed_count > 0,
+            "embeddings should be generated during sync"
+        );
 
         // Every chunk should have a corresponding embedding
         let chunk_count: i64 = store
             .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM knowledge_chunk_meta",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM knowledge_chunk_meta", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(
             chunk_count, embed_count,
@@ -2043,16 +1965,8 @@ mod integration_tests {
         let dir = tempdir().unwrap();
 
         // a.md links to b.md and c.md; b.md links back to a.md
-        fs::write(
-            dir.path().join("a.md"),
-            "# Note A\nSee [[b]] and [[c]]",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join("b.md"),
-            "# Note B\nBack to [[a]]",
-        )
-        .unwrap();
+        fs::write(dir.path().join("a.md"), "# Note A\nSee [[b]] and [[c]]").unwrap();
+        fs::write(dir.path().join("b.md"), "# Note B\nBack to [[a]]").unwrap();
         fs::write(dir.path().join("c.md"), "# Note C\nStandalone").unwrap();
 
         let enrichments = vec!["wikilinks".to_string()];
@@ -2061,10 +1975,13 @@ mod integration_tests {
             .unwrap();
         let source = store.get_source("graph").unwrap().unwrap();
 
-        let enrich_fn =
-            enrichment::build_enrichment_fn(&source.enrichments, std::path::Path::new(&source.path));
-        let enrich_ref =
-            enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &std::path::Path) -> serde_json::Value);
+        let enrich_fn = enrichment::build_enrichment_fn(
+            &source.enrichments,
+            std::path::Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &std::path::Path) -> serde_json::Value);
         let result = sync::sync_source(&store, &source, enrich_ref).unwrap();
 
         // Should have created links: a→b, a→c, b→a
@@ -2115,10 +2032,13 @@ mod integration_tests {
             .unwrap();
         let source = store.get_source("doomed").unwrap().unwrap();
 
-        let enrich_fn =
-            enrichment::build_enrichment_fn(&source.enrichments, std::path::Path::new(&source.path));
-        let enrich_ref =
-            enrich_fn.as_ref().map(|f| f.as_ref() as &dyn Fn(&str, &std::path::Path) -> serde_json::Value);
+        let enrich_fn = enrichment::build_enrichment_fn(
+            &source.enrichments,
+            std::path::Path::new(&source.path),
+        );
+        let enrich_ref = enrich_fn
+            .as_ref()
+            .map(|f| f.as_ref() as &dyn Fn(&str, &std::path::Path) -> serde_json::Value);
         sync::sync_source(&store, &source, enrich_ref).unwrap();
         assert!(store.link_count_for_source(source.id).unwrap() > 0);
 

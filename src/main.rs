@@ -10,6 +10,9 @@ mod indexdir;
 mod knowledge;
 mod mcp;
 mod promote;
+mod retrieval;
+mod search_memory;
+mod search_model;
 mod session;
 mod stats;
 mod store;
@@ -25,7 +28,7 @@ use std::time::Duration;
 
 use cli::{Cli, Commands, KnowledgeAction};
 use config::Config;
-use embedder::Embed;
+use embedder::{Embed, Embedder};
 use knowledge::{enrichment, sync, KnowledgeStore};
 use store::ContentStore;
 
@@ -101,31 +104,50 @@ fn main() -> Result<()> {
             source,
             content_type,
             limit,
+            profile,
+            explain,
+            no_memory,
         }) => {
-            let _config = Config::load()?;
+            let config = Config::load()?;
             let store = ContentStore::open(&project_dir())?;
+            let session_store = session::SessionStore::open(&project_dir())?;
+            let profile = search_model::SearchProfile::parse(profile.as_deref())?;
+            let knowledge_store = if config.knowledge.enabled {
+                let mut ks = KnowledgeStore::open()?;
+                if config.embeddings.enabled {
+                    let model_dir =
+                        PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
+                    if let Ok(embedder) = Embedder::new(&model_dir) {
+                        let arc: Arc<dyn Embed> = Arc::new(embedder);
+                        ks.set_embedder(Arc::clone(&arc));
+                    }
+                }
+                Some(ks)
+            } else {
+                None
+            };
 
             stats::record_search();
-            let results =
-                store.search(&query, limit, source.as_deref(), content_type.as_deref())?;
-
-            if results.is_empty() {
-                println!("{}", "No results found.".yellow());
-            } else {
-                for result in &results {
-                    let snippet = truncate::preview(&result.content, 500);
-                    println!(
-                        "{} {} (source: {}, type: {}, score: {:.4})",
-                        "->".green(),
-                        result.title.bold(),
-                        result.source.cyan(),
-                        result.content_type.dimmed(),
-                        result.score
-                    );
-                    println!("{snippet}\n");
-                }
-                println!("{} results", results.len());
-            }
+            let outcome = retrieval::run_query(
+                retrieval::QueryRequest {
+                    query: &query,
+                    source: source.as_deref(),
+                    content_type: content_type.as_deref(),
+                    knowledge_filter: None,
+                    limit,
+                    snippet_bytes: config.search.snippet_bytes,
+                    profile,
+                    explain,
+                    use_memory: !no_memory,
+                    include_knowledge: true,
+                },
+                &config,
+                &store,
+                session_store.conn(),
+                knowledge_store.as_ref(),
+                false,
+            )?;
+            println!("{}", outcome.text);
             Ok(())
         }
 
@@ -461,8 +483,8 @@ fn main() -> Result<()> {
 
             // Share the embedder for sync operations
             if config.embeddings.enabled {
-                let model_dir = PathBuf::from(&config.embeddings.model_dir)
-                    .join(&config.embeddings.model);
+                let model_dir =
+                    PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
                 if let Ok(embedder) = embedder::Embedder::new(&model_dir) {
                     ks.set_embedder(Arc::new(embedder));
                 }
@@ -512,11 +534,9 @@ fn main() -> Result<()> {
                 }
                 KnowledgeAction::Sync { label } => {
                     let results = if let Some(label) = label {
-                        let source = ks
-                            .get_source(&label)?
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Knowledge source '{}' not found", label)
-                            })?;
+                        let source = ks.get_source(&label)?.ok_or_else(|| {
+                            anyhow::anyhow!("Knowledge source '{}' not found", label)
+                        })?;
                         vec![sync_source_cli(&ks, &source)?]
                     } else {
                         let sources = ks.list_sources()?;
@@ -549,43 +569,33 @@ fn main() -> Result<()> {
                     filter,
                     source,
                     limit,
+                    profile,
+                    explain,
+                    no_memory,
                 } => {
-                    let weights = crate::store::search::SearchWeights {
-                        keyword_weight: config.search.keyword_weight,
-                        vector_weight: config.search.vector_weight,
-                    };
-                    let results = knowledge::search::knowledge_search(
-                        &ks,
-                        &query,
-                        filter.as_deref(),
-                        source.as_deref(),
-                        limit,
-                        &weights,
-                        config.search.snippet_bytes,
+                    let session_store = session::SessionStore::open(&project_dir())?;
+                    let store = ContentStore::open(&project_dir())?;
+                    let profile = search_model::SearchProfile::parse(profile.as_deref())?;
+                    let outcome = retrieval::run_query(
+                        retrieval::QueryRequest {
+                            query: &query,
+                            source: source.as_deref(),
+                            content_type: None,
+                            knowledge_filter: filter.as_deref(),
+                            limit,
+                            snippet_bytes: config.search.snippet_bytes,
+                            profile,
+                            explain,
+                            use_memory: !no_memory,
+                            include_knowledge: true,
+                        },
+                        &config,
+                        &store,
+                        session_store.conn(),
+                        Some(&ks),
+                        false,
                     )?;
-                    if results.is_empty() {
-                        println!("{}", "No results found.".yellow());
-                    } else {
-                        for (i, r) in results.iter().enumerate() {
-                            println!(
-                                "{} {}. [{}] {} (score: {:.3})",
-                                "->".green(),
-                                i + 1,
-                                r.source_label.cyan(),
-                                r.title.bold(),
-                                r.score
-                            );
-                            println!(
-                                "   File: {} (lines {})",
-                                r.file_path.dimmed(),
-                                r.lines
-                            );
-                            let snippet =
-                                crate::truncate::preview(&r.snippet, 200);
-                            println!("   {snippet}\n");
-                        }
-                        println!("{} results", results.len());
-                    }
+                    println!("{}", outcome.text);
                     Ok(())
                 }
                 KnowledgeAction::Status => {
@@ -596,16 +606,9 @@ fn main() -> Result<()> {
                         println!("{}", "Knowledge Sources:".bold());
                         println!();
                         for s in &sources {
-                            println!(
-                                "  {} {}",
-                                "->".green(),
-                                s.label.bold(),
-                            );
+                            println!("  {} {}", "->".green(), s.label.bold(),);
                             println!("    Path: {}", s.path);
-                            println!(
-                                "    Glob: {}",
-                                s.glob.as_deref().unwrap_or("all files")
-                            );
+                            println!("    Glob: {}", s.glob.as_deref().unwrap_or("all files"));
                             println!(
                                 "    Enrichments: {}",
                                 if s.enrichments.is_empty() {
@@ -614,10 +617,7 @@ fn main() -> Result<()> {
                                     s.enrichments.join(", ")
                                 }
                             );
-                            println!(
-                                "    Files: {} | Chunks: {}",
-                                s.file_count, s.chunk_count
-                            );
+                            println!("    Files: {} | Chunks: {}", s.file_count, s.chunk_count);
                             println!(
                                 "    Last sync: {}",
                                 s.last_sync.as_deref().unwrap_or("never")

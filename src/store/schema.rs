@@ -1,6 +1,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::search_memory;
+
 /// Initialize the content store schema (FTS5 tables + metadata)
 pub fn init_content_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -115,5 +117,6 @@ pub fn init_session_schema(conn: &Connection) -> Result<()> {
              access_count INTEGER NOT NULL DEFAULT 1
          );",
     )?;
+    search_memory::init_session_schema(conn)?;
     Ok(())
 }

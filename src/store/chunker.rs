@@ -101,8 +101,8 @@ fn classify_content(content: &str) -> ContentType {
 
     // --- Markdown check (priority) ---
     if line_count > 0 && md_score > 0 {
-        let md_passes = (md_score as f64 / line_count as f64) > 0.02
-            && !(md_code_counter > md_score * 2);
+        let md_passes =
+            (md_score as f64 / line_count as f64) > 0.02 && !(md_code_counter > md_score * 2);
         if md_passes {
             return ContentType::Markdown;
         }

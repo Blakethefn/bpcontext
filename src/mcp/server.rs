@@ -16,6 +16,9 @@ use crate::fetch;
 use crate::indexdir;
 use crate::knowledge::{self, enrichment, sync, KnowledgeStore};
 use crate::promote;
+use crate::retrieval;
+use crate::search_memory;
+use crate::search_model::SearchProfile;
 use crate::session::SessionStore;
 use crate::stats;
 use crate::store::ContentStore;
@@ -28,8 +31,7 @@ pub fn run(project_dir: &Path) -> Result<()> {
 
     // Shared embedder — used by both session and knowledge stores
     let shared_embedder: Option<Arc<dyn Embed>> = if config.embeddings.enabled {
-        let model_dir =
-            PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
+        let model_dir = PathBuf::from(&config.embeddings.model_dir).join(&config.embeddings.model);
         match Embedder::new(&model_dir) {
             Ok(embedder) => {
                 let arc: Arc<dyn Embed> = Arc::new(embedder);
@@ -225,9 +227,11 @@ fn handle_tool_call(
     match tool_name {
         "bpx_execute" => handle_execute(args, config, store),
         "bpx_batch_execute" => handle_batch_execute(args, config, store),
-        "bpx_search" => handle_search(args, config, store, knowledge_store),
+        "bpx_search" => handle_search(args, config, store, session_store, knowledge_store),
         "bpx_execute_file" => handle_execute_file(args, config, store),
-        "bpx_read_chunks" => handle_read_chunks(args, config, store),
+        "bpx_read_chunks" => {
+            handle_read_chunks(args, config, store, session_store, knowledge_store)
+        }
         "bpx_fetch_and_index" => handle_fetch_and_index(args, config, store),
         "bpx_index" => handle_index(args, store),
         "bpx_promote" => handle_promote(args, config, store),
@@ -263,7 +267,7 @@ fn handle_tool_call(
         "bpx_knowledge_links" => {
             let ks = knowledge_store
                 .ok_or_else(|| anyhow::anyhow!("Knowledge store is disabled or unavailable"))?;
-            handle_knowledge_links(args, ks, config)
+            handle_knowledge_links(args, ks, config, session_store)
         }
         _ => anyhow::bail!("Unknown tool: {tool_name}"),
     }
@@ -432,6 +436,7 @@ fn handle_search(
     args: &Value,
     config: &Config,
     store: &ContentStore,
+    session_store: &SessionStore,
     knowledge_store: Option<&KnowledgeStore>,
 ) -> Result<String> {
     let queries = args["queries"].as_array().unwrap_or(&Vec::new()).clone();
@@ -446,14 +451,11 @@ fn handle_search(
     let include_knowledge = args["include_knowledge"].as_bool().unwrap_or(true);
     let knowledge_filter = args["filter"].as_str();
     let count_only = args["count_only"].as_bool().unwrap_or(false);
-
-    let weights = search_weights(config);
-
-    // Check if knowledge results should be merged
-    let use_knowledge = include_knowledge
-        && knowledge_store
-            .map(|ks| !ks.list_sources().unwrap_or_default().is_empty())
-            .unwrap_or(false);
+    let profile = SearchProfile::parse(args["profile"].as_str())?;
+    let explain = args["explain"].as_bool().unwrap_or(false);
+    let use_memory = args["use_memory"]
+        .as_bool()
+        .unwrap_or(profile.is_explicit());
 
     // Accumulators for count_only mode
     let mut co_total_chunks: usize = 0;
@@ -470,102 +472,48 @@ fn handle_search(
         }
 
         stats::record_search();
-
-        // Session-only search
-        let results = store.search_with_weights(query, limit, source, content_type, &weights)?;
-
-        // Knowledge search (merged via combined_search)
-        let knowledge_results = if use_knowledge {
-            let ks = knowledge_store.unwrap();
-            knowledge::search::knowledge_search(
-                ks,
+        let outcome = retrieval::run_query(
+            retrieval::QueryRequest {
                 query,
+                source,
+                content_type,
                 knowledge_filter,
-                None,
                 limit,
-                &weights,
-                top_snippet_bytes,
-            )
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+                snippet_bytes: top_snippet_bytes,
+                profile,
+                explain,
+                use_memory,
+                include_knowledge,
+            },
+            config,
+            store,
+            session_store.conn(),
+            knowledge_store,
+            count_only,
+        )?;
 
-        // COUNT-ONLY: accumulate stats and skip content serialization
         if count_only {
-            for r in &results {
-                co_total_bytes += r.content.len() as u64;
-                co_sources.insert(r.source.clone());
+            co_total_bytes += outcome.estimated_bytes;
+            co_total_chunks += outcome.total_chunks;
+            for source in outcome.sources_matched {
+                co_sources.insert(source);
             }
-            for kr in &knowledge_results {
-                co_total_bytes += kr.snippet.len() as u64;
-                co_sources.insert(kr.source_label.clone());
-            }
-            co_total_chunks += results.len() + knowledge_results.len();
             continue;
         }
 
-        output.push_str(&format!("### \"{query}\"\n"));
-
-        if results.is_empty() && knowledge_results.is_empty() {
-            output.push_str("No results.\n\n");
-        } else {
-            let mut truncated_any = false;
-
-            // Session results
-            for (i, result) in results.iter().enumerate() {
-                let max_bytes = if i < config.search.top_result_count {
-                    top_snippet_bytes
-                } else {
-                    config.search.secondary_snippet_bytes
-                };
-                let (snippet, truncated, snippet_visible) =
-                    preview_snippet(&result.content, max_bytes);
-                truncated_any |= truncated;
-                visible_bytes += snippet_visible as u64;
-                let line_info = if result.line_start > 0 {
-                    format!(", lines: {}-{}", result.line_start, result.line_end)
-                } else {
-                    String::new()
-                };
-                output.push_str(&format!(
-                    "**[{}]** (source: {}, source_id: {}, type: {}, score: {:.4}{line_info})\n{snippet}\n\n",
-                    result.title, result.source, result.source_id, result.content_type, result.score
-                ));
-            }
-
-            // Knowledge results
-            if !knowledge_results.is_empty() {
-                output.push_str("#### Knowledge results\n");
-                for (i, kr) in knowledge_results.iter().enumerate() {
-                    let max_bytes = if i < config.search.top_result_count {
-                        top_snippet_bytes
-                    } else {
-                        config.search.secondary_snippet_bytes
-                    };
-                    let (snippet, truncated, snippet_visible) =
-                        preview_snippet(&kr.snippet, max_bytes);
-                    truncated_any |= truncated;
-                    visible_bytes += snippet_visible as u64;
-                    output.push_str(&format!(
-                        "**[{}]** (source: {}, type: knowledge, file: {}, score: {:.4})\n{snippet}\n\n",
-                        kr.title, kr.source_label, kr.file_path, kr.score
-                    ));
-                }
-            }
-
-            if truncated_any {
-                output.push_str(
-                    "Some results were truncated. Use bpx_read_chunks with the source label to see full content.\n\n"
-                );
-            }
-        }
+        visible_bytes += outcome.visible_bytes;
+        output.push_str(&outcome.text);
+        output.push('\n');
     }
 
     // COUNT-ONLY: return size metadata without content
     if count_only {
         let estimated_tokens = (co_total_bytes as f64 / 4.0).ceil() as u32;
-        let recommendation = if estimated_tokens <= 20_000 { "inline" } else { "delegate" };
+        let recommendation = if estimated_tokens <= 20_000 {
+            "inline"
+        } else {
+            "delegate"
+        };
         let mut sources_vec: Vec<String> = co_sources.into_iter().collect();
         sources_vec.sort();
         let queries_echo: Vec<serde_json::Value> = queries
@@ -576,6 +524,8 @@ fn handle_search(
         return Ok(serde_json::to_string_pretty(&json!({
             "count_only": true,
             "queries": queries_echo,
+            "profile": profile.as_str(),
+            "memory_applied": use_memory && profile.is_explicit(),
             "total_chunks": co_total_chunks,
             "estimated_bytes": co_total_bytes,
             "estimated_tokens": estimated_tokens,
@@ -684,10 +634,20 @@ fn handle_execute_file(args: &Value, config: &Config, store: &ContentStore) -> R
     ))
 }
 
-fn handle_read_chunks(args: &Value, config: &Config, store: &ContentStore) -> Result<String> {
+fn handle_read_chunks(
+    args: &Value,
+    config: &Config,
+    store: &ContentStore,
+    session_store: &SessionStore,
+    knowledge_store: Option<&KnowledgeStore>,
+) -> Result<String> {
     let label = args["label"].as_str().unwrap_or("");
     let query = args["query"].as_str().filter(|q| !q.trim().is_empty());
     let max_chunks = args["max_chunks"].as_u64().unwrap_or(10) as usize;
+
+    if let Some(ks) = knowledge_store {
+        let _ = search_memory::reinforce_from_read_chunks(session_store.conn(), ks.conn(), label);
+    }
 
     if let Some(query) = query {
         stats::record_search();
@@ -1146,8 +1106,15 @@ fn handle_knowledge_search(args: &Value, ks: &KnowledgeStore, config: &Config) -
 
     let weights = search_weights(config);
 
-    let results =
-        knowledge::search::knowledge_search(ks, query, filter, source, limit, &weights, snippet_bytes)?;
+    let results = knowledge::search::knowledge_search(
+        ks,
+        query,
+        filter,
+        source,
+        limit,
+        &weights,
+        snippet_bytes,
+    )?;
 
     let mut output = String::new();
     for (i, r) in results.iter().enumerate() {
@@ -1210,6 +1177,7 @@ fn handle_knowledge_links(
     args: &Value,
     ks: &crate::knowledge::KnowledgeStore,
     config: &crate::config::Config,
+    session_store: &SessionStore,
 ) -> Result<String> {
     use crate::knowledge::filter::parse_filter;
     use crate::knowledge::LinkDirection;
@@ -1224,6 +1192,12 @@ fn handle_knowledge_links(
     let count_only = args["count_only"].as_bool().unwrap_or(false);
     let filter_predicates = parse_filter(args["filter"].as_str());
     let depth = args["depth"].as_u64().unwrap_or(1).max(1).min(3) as u32;
+    let _ = search_memory::reinforce_from_knowledge_links(
+        session_store.conn(),
+        ks.conn(),
+        args["query"].as_str(),
+        args["file"].as_str(),
+    );
 
     // Resolve the starting file_id
     let file_id: i64 = if let Some(file_path) = args["file"].as_str() {
@@ -1237,7 +1211,9 @@ fn handle_knowledge_links(
                     rusqlite::params![label, file_path],
                     |row| row.get(0),
                 )
-                .map_err(|_| anyhow::anyhow!("File '{}' not found in source '{}'", file_path, label))?
+                .map_err(|_| {
+                    anyhow::anyhow!("File '{}' not found in source '{}'", file_path, label)
+                })?
         } else {
             ks.conn()
                 .query_row(
@@ -1374,7 +1350,10 @@ fn tool_label(tool_name: &str, args: &Value) -> String {
         "bpx_stats" => "stats".to_string(),
         "bpx_sources" => "sources".to_string(),
         "bpx_context_status" => "context-status".to_string(),
-        "bpx_knowledge_add" => args["label"].as_str().unwrap_or("knowledge-add").to_string(),
+        "bpx_knowledge_add" => args["label"]
+            .as_str()
+            .unwrap_or("knowledge-add")
+            .to_string(),
         "bpx_knowledge_sync" => args["label"]
             .as_str()
             .map(|l| format!("knowledge-sync:{l}"))
@@ -1532,15 +1511,21 @@ mod tests {
     #[test]
     fn test_read_chunks_returns_full_content() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let content = two_section_content(
             &repeated_line("intro line\n", 350),
             &format!("{}\nFULL_CHUNK_MARKER", repeated_line("detail line\n", 350)),
         );
         store.index("manual.md", &content, None).unwrap();
 
-        let result =
-            handle_read_chunks(&json!({ "label": "manual.md" }), &test_config(), &store).unwrap();
+        let result = handle_read_chunks(
+            &json!({ "label": "manual.md" }),
+            &test_config(),
+            &store,
+            &session_store,
+            None,
+        )
+        .unwrap();
 
         assert!(result.contains("FULL_CHUNK_MARKER"));
         assert!(!result.contains("[truncated"));
@@ -1549,7 +1534,7 @@ mod tests {
     #[test]
     fn test_read_chunks_with_query_filters() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let content = two_section_content(
             "alpha section\nalpha section\nalpha section",
             "needle-target\nneedle-target\nneedle-target",
@@ -1560,6 +1545,8 @@ mod tests {
             &json!({ "label": "filtered.md", "query": "needle-target" }),
             &test_config(),
             &store,
+            &session_store,
+            None,
         )
         .unwrap();
 
@@ -1570,7 +1557,7 @@ mod tests {
     #[test]
     fn test_search_tiered_snippets() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let mut config = test_config();
         config.search.top_result_count = 2;
         config.search.snippet_bytes = 2000;
@@ -1600,6 +1587,7 @@ mod tests {
             &json!({ "queries": ["needle"], "limit": 4 }),
             &config,
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -1613,7 +1601,7 @@ mod tests {
     #[test]
     fn test_search_snippet_bytes_param() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let mut config = test_config();
         config.search.top_result_count = 1;
         config.search.snippet_bytes = 2000;
@@ -1629,6 +1617,7 @@ mod tests {
             &json!({ "queries": ["needle"], "limit": 1, "snippet_bytes": 120 }),
             &config,
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -1786,7 +1775,7 @@ mod tests {
     #[test]
     fn test_search_truncation_hint() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let mut config = test_config();
         config.search.top_result_count = 1;
         config.search.snippet_bytes = 100;
@@ -1794,8 +1783,14 @@ mod tests {
         let content = format!("{}{}", "needle ".repeat(5), "h".repeat(1500));
         store.index("hint", &content, None).unwrap();
 
-        let result =
-            handle_search(&json!({ "queries": ["needle"] }), &config, &store, None).unwrap();
+        let result = handle_search(
+            &json!({ "queries": ["needle"] }),
+            &config,
+            &store,
+            &session_store,
+            None,
+        )
+        .unwrap();
 
         assert!(result.contains("Some results were truncated"));
         assert!(result.contains("bpx_read_chunks"));
@@ -1887,10 +1882,7 @@ mod tests {
             &config,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("does not exist"));
+        assert!(result.unwrap_err().to_string().contains("does not exist"));
     }
 
     #[test]
@@ -1971,8 +1963,13 @@ mod tests {
     #[test]
     fn test_knowledge_status_lists_sources() {
         let ks = make_knowledge_store();
-        ks.add_source("vault", "/tmp/vault", Some("**/*.md"), &["frontmatter".to_string()])
-            .unwrap();
+        ks.add_source(
+            "vault",
+            "/tmp/vault",
+            Some("**/*.md"),
+            &["frontmatter".to_string()],
+        )
+        .unwrap();
 
         let result = handle_knowledge_status(&ks).unwrap();
         assert!(result.contains("vault"));
@@ -2046,12 +2043,9 @@ mod tests {
         sync_source_with_enrichment(&ks, &source).unwrap();
 
         let config = test_config();
-        let result = handle_knowledge_search(
-            &json!({"query": "unique marker search"}),
-            &ks,
-            &config,
-        )
-        .unwrap();
+        let result =
+            handle_knowledge_search(&json!({"query": "unique marker search"}), &ks, &config)
+                .unwrap();
 
         assert!(!result.contains("No results found"));
         assert!(result.contains("test"));
@@ -2060,7 +2054,7 @@ mod tests {
     #[test]
     fn test_search_without_knowledge_works() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         store
             .index("no-knowledge", "some searchable content", None)
             .unwrap();
@@ -2069,6 +2063,7 @@ mod tests {
             &json!({"queries": ["searchable"]}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2079,16 +2074,15 @@ mod tests {
     #[test]
     fn test_search_with_empty_knowledge_works() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let ks = make_knowledge_store();
-        store
-            .index("with-empty-ks", "session data", None)
-            .unwrap();
+        store.index("with-empty-ks", "session data", None).unwrap();
 
         let result = handle_search(
             &json!({"queries": ["session data"]}),
             &test_config(),
             &store,
+            &session_store,
             Some(&ks),
         )
         .unwrap();
@@ -2101,7 +2095,7 @@ mod tests {
     #[test]
     fn test_search_with_include_knowledge_false() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         let ks = make_knowledge_store();
         ks.add_source("src", "/tmp/src", None, &[]).unwrap();
         store
@@ -2112,6 +2106,7 @@ mod tests {
             &json!({"queries": ["content"], "include_knowledge": false}),
             &test_config(),
             &store,
+            &session_store,
             Some(&ks),
         )
         .unwrap();
@@ -2124,13 +2119,14 @@ mod tests {
     #[test]
     fn test_count_only_returns_no_content() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         store.index("co-src", "hello world needle", None).unwrap();
 
         let result = handle_search(
             &json!({"queries": ["needle"], "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2145,14 +2141,19 @@ mod tests {
     #[test]
     fn test_count_only_total_matches_full_call() {
         reset_stats();
-        let (_dir, store) = make_store();
-        store.index("match-a", "unique_keyword_xyz alpha", None).unwrap();
-        store.index("match-b", "unique_keyword_xyz beta", None).unwrap();
+        let (_dir, store, session_store) = make_store_with_session();
+        store
+            .index("match-a", "unique_keyword_xyz alpha", None)
+            .unwrap();
+        store
+            .index("match-b", "unique_keyword_xyz beta", None)
+            .unwrap();
 
         let count_result = handle_search(
             &json!({"queries": ["unique_keyword_xyz"], "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2160,6 +2161,7 @@ mod tests {
             &json!({"queries": ["unique_keyword_xyz"]}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2175,13 +2177,16 @@ mod tests {
     #[test]
     fn test_count_only_token_estimate_is_ceil_bytes_over_4() {
         reset_stats();
-        let (_dir, store) = make_store();
-        store.index("tok-src", "estimate_keyword_abc ".repeat(10).trim(), None).unwrap();
+        let (_dir, store, session_store) = make_store_with_session();
+        store
+            .index("tok-src", "estimate_keyword_abc ".repeat(10).trim(), None)
+            .unwrap();
 
         let result = handle_search(
             &json!({"queries": ["estimate_keyword_abc"], "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2196,14 +2201,17 @@ mod tests {
     #[test]
     fn test_recommendation_inline_when_under_threshold() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         // Small content — well under 20k tokens
-        store.index("small-src", "inline_threshold_kw small content", None).unwrap();
+        store
+            .index("small-src", "inline_threshold_kw small content", None)
+            .unwrap();
 
         let result = handle_search(
             &json!({"queries": ["inline_threshold_kw"], "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2215,19 +2223,22 @@ mod tests {
     #[test]
     fn test_recommendation_delegate_when_over_threshold() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         // 20k tokens = 80k bytes. Index 30 sources with ~3000 bytes each = ~90k bytes.
         // Each chunk stays under MAX_CHUNK_BYTES (4096) so no splitting, ensuring
         // each source contributes exactly one chunk to the search results.
         for i in 0..30usize {
             let content = format!("delegate_threshold_kw {}", "x".repeat(2960 - i));
-            store.index(&format!("big-src-{i}"), &content, None).unwrap();
+            store
+                .index(&format!("big-src-{i}"), &content, None)
+                .unwrap();
         }
 
         let result = handle_search(
             &json!({"queries": ["delegate_threshold_kw"], "limit": 30, "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2239,13 +2250,16 @@ mod tests {
     #[test]
     fn test_count_only_false_behaves_as_normal() {
         reset_stats();
-        let (_dir, store) = make_store();
-        store.index("norm-src", "normal_kw_check content here", None).unwrap();
+        let (_dir, store, session_store) = make_store_with_session();
+        store
+            .index("norm-src", "normal_kw_check content here", None)
+            .unwrap();
 
         let with_false = handle_search(
             &json!({"queries": ["normal_kw_check"], "count_only": false}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2253,6 +2267,7 @@ mod tests {
             &json!({"queries": ["normal_kw_check"]}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2263,15 +2278,22 @@ mod tests {
     #[test]
     fn test_limit_param_respected_in_count_mode() {
         reset_stats();
-        let (_dir, store) = make_store();
+        let (_dir, store, session_store) = make_store_with_session();
         for i in 0..10usize {
-            store.index(&format!("lim-src-{i}"), &format!("limit_kw_test content {i}"), None).unwrap();
+            store
+                .index(
+                    &format!("lim-src-{i}"),
+                    &format!("limit_kw_test content {i}"),
+                    None,
+                )
+                .unwrap();
         }
 
         let limited = handle_search(
             &json!({"queries": ["limit_kw_test"], "limit": 3, "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2279,6 +2301,7 @@ mod tests {
             &json!({"queries": ["limit_kw_test"], "count_only": true}),
             &test_config(),
             &store,
+            &session_store,
             None,
         )
         .unwrap();
@@ -2287,8 +2310,14 @@ mod tests {
         let uv: serde_json::Value = serde_json::from_str(&unlimited).unwrap();
         let limited_count = lv["total_chunks"].as_u64().unwrap();
         let unlimited_count = uv["total_chunks"].as_u64().unwrap();
-        assert!(limited_count <= 3, "limit=3 should cap chunks at 3, got {limited_count}");
-        assert!(unlimited_count > limited_count, "unlimited should return more chunks");
+        assert!(
+            limited_count <= 3,
+            "limit=3 should cap chunks at 3, got {limited_count}"
+        );
+        assert!(
+            unlimited_count > limited_count,
+            "unlimited should return more chunks"
+        );
     }
 
     #[test]
@@ -2307,10 +2336,7 @@ mod tests {
             "vault"
         );
         assert_eq!(
-            tool_label(
-                "bpx_knowledge_sync",
-                &json!({"label": "docs"})
-            ),
+            tool_label("bpx_knowledge_sync", &json!({"label": "docs"})),
             "knowledge-sync:docs"
         );
         assert_eq!(
@@ -2326,10 +2352,7 @@ mod tests {
             "knowledge-status"
         );
         assert_eq!(
-            tool_label(
-                "bpx_knowledge_remove",
-                &json!({"label": "old"})
-            ),
+            tool_label("bpx_knowledge_remove", &json!({"label": "old"})),
             "old"
         );
     }

@@ -93,6 +93,19 @@ pub fn tool_definitions() -> Value {
                             "type": "string",
                             "description": "Metadata filter for knowledge results (e.g., 'type:task status:active')"
                         },
+                        "profile": {
+                            "type": "string",
+                            "enum": ["code_review", "debug", "planning", "vault_navigation"],
+                            "description": "Optional retrieval profile that tunes ranking, snippets, graph behavior, and query expansion."
+                        },
+                        "explain": {
+                            "type": "boolean",
+                            "description": "If true, include a fuller per-result ranking explanation."
+                        },
+                        "use_memory": {
+                            "type": "boolean",
+                            "description": "Reuse exact-query learned search memory when available (default: true for explicit profiles)."
+                        },
                         "count_only": {
                             "type": "boolean",
                             "description": "If true, returns only chunk count and estimated token size — no content. Use before large queries to decide whether to inline or delegate to a subagent."
