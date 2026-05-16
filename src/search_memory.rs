@@ -183,6 +183,7 @@ pub fn reinforce_from_knowledge_links(
     knowledge_conn: &Connection,
     query: Option<&str>,
     file_path: Option<&str>,
+    source_label: Option<&str>,
 ) -> Result<bool> {
     let run = if let Some(file_path) = file_path {
         latest_run_for_file(session_conn, file_path)?
@@ -200,7 +201,7 @@ pub fn reinforce_from_knowledge_links(
             &run.effective_query,
             run.applied_source_hint.as_deref(),
             run.applied_filter_hint.as_deref(),
-            run.applied_source_hint.as_deref(),
+            source_label.or(run.applied_source_hint.as_deref()),
             file_path,
         )?;
         return Ok(true);

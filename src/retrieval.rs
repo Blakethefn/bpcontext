@@ -70,14 +70,18 @@ pub fn run_query(
             if let Some(memory) =
                 search_memory::lookup_memory(ks.conn(), request.query, request.profile)?
             {
+                let memory_source_hint = memory
+                    .learned_source_hint
+                    .clone()
+                    .or(memory.winning_source_label.clone());
                 if effective_query == request.query.trim()
                     && memory.learned_query != request.query.trim()
                 {
                     effective_query = memory.learned_query;
                     memory_applied = true;
                 }
-                if source_hint.is_none() && memory.learned_source_hint.is_some() {
-                    source_hint = memory.learned_source_hint;
+                if source_hint.is_none() && memory_source_hint.is_some() {
+                    source_hint = memory_source_hint;
                     memory_applied = true;
                 }
                 if filter_hint.is_none() && memory.learned_filter_hint.is_some() {

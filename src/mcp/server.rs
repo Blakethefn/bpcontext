@@ -461,6 +461,7 @@ fn handle_search(
     let mut co_total_chunks: usize = 0;
     let mut co_total_bytes: u64 = 0;
     let mut co_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut co_memory_applied = false;
 
     let mut output = String::new();
     let mut visible_bytes = 0u64;
@@ -495,6 +496,7 @@ fn handle_search(
         if count_only {
             co_total_bytes += outcome.estimated_bytes;
             co_total_chunks += outcome.total_chunks;
+            co_memory_applied |= outcome.memory_applied;
             for source in outcome.sources_matched {
                 co_sources.insert(source);
             }
@@ -525,7 +527,7 @@ fn handle_search(
             "count_only": true,
             "queries": queries_echo,
             "profile": profile.as_str(),
-            "memory_applied": use_memory && profile.is_explicit(),
+            "memory_applied": co_memory_applied,
             "total_chunks": co_total_chunks,
             "estimated_bytes": co_total_bytes,
             "estimated_tokens": estimated_tokens,
@@ -1192,12 +1194,6 @@ fn handle_knowledge_links(
     let count_only = args["count_only"].as_bool().unwrap_or(false);
     let filter_predicates = parse_filter(args["filter"].as_str());
     let depth = args["depth"].as_u64().unwrap_or(1).max(1).min(3) as u32;
-    let _ = search_memory::reinforce_from_knowledge_links(
-        session_store.conn(),
-        ks.conn(),
-        args["query"].as_str(),
-        args["file"].as_str(),
-    );
 
     // Resolve the starting file_id
     let file_id: i64 = if let Some(file_path) = args["file"].as_str() {
@@ -1251,6 +1247,23 @@ fn handle_knowledge_links(
     } else {
         anyhow::bail!("Either 'file' or 'query' is required");
     };
+
+    let resolved_source_label: String = ks.conn().query_row(
+        "SELECT ks.label
+         FROM knowledge_files kf
+         JOIN knowledge_sources ks ON ks.id = kf.source_id
+         WHERE kf.id = ?1",
+        rusqlite::params![file_id],
+        |row| row.get(0),
+    )?;
+
+    let _ = search_memory::reinforce_from_knowledge_links(
+        session_store.conn(),
+        ks.conn(),
+        args["query"].as_str(),
+        args["file"].as_str(),
+        Some(&resolved_source_label),
+    );
 
     let preds = if filter_predicates.is_empty() {
         None
@@ -2318,6 +2331,108 @@ mod tests {
             unlimited_count > limited_count,
             "unlimited should return more chunks"
         );
+    }
+
+    #[test]
+    fn test_count_only_reports_actual_memory_application() {
+        reset_stats();
+        let (_dir, store, session_store) = make_store_with_session();
+        store
+            .index("session-hit", "panic exception failure root cause", None)
+            .unwrap();
+
+        let result = handle_search(
+            &json!({"queries": ["panic exception"], "profile": "debug", "count_only": true}),
+            &test_config(),
+            &store,
+            &session_store,
+            None,
+        )
+        .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["memory_applied"], false);
+    }
+
+    #[test]
+    fn test_knowledge_links_reinforcement_reuses_winning_source_label() {
+        reset_stats();
+        let dir = tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "root-cause.md",
+            "# Root Cause\npanic trace exception failure root cause\n\nSee [[followup-plan]].\n",
+        );
+        write_file(
+            dir.path(),
+            "followup-plan.md",
+            "# Followup Plan\narchitecture plan steps for rollout sequencing\n\nLinks [[root-cause]].\n",
+        );
+
+        let (_session_dir, store, session_store) = make_store_with_session();
+        store
+            .index(
+                "session-hit",
+                "panic exception stack trace failure root cause",
+                None,
+            )
+            .unwrap();
+
+        let ks = make_knowledge_store();
+        ks.add_source(
+            "demo",
+            &dir.path().display().to_string(),
+            None,
+            &["wikilinks".to_string()],
+        )
+        .unwrap();
+        let source = ks.get_source("demo").unwrap().unwrap();
+        sync_source_with_enrichment(&ks, &source).unwrap();
+
+        let first = handle_search(
+            &json!({"queries": ["panic exception"], "profile": "debug", "explain": true}),
+            &test_config(),
+            &store,
+            &session_store,
+            Some(&ks),
+        )
+        .unwrap();
+        assert!(first.contains("session-hit"));
+        assert!(first.contains("root-cause.md"));
+
+        let links = handle_knowledge_links(
+            &json!({"file": "root-cause.md", "source": "demo", "direction": "both", "limit": 5}),
+            &ks,
+            &test_config(),
+            &session_store,
+        )
+        .unwrap();
+        assert!(links.contains("followup-plan.md"));
+
+        let second = handle_search(
+            &json!({"queries": ["panic exception"], "profile": "debug", "explain": true}),
+            &test_config(),
+            &store,
+            &session_store,
+            Some(&ks),
+        )
+        .unwrap();
+        assert!(second.contains("Search memory adjusted this query plan"));
+        assert!(second.contains("memory-source"));
+        assert!(second.contains("source: demo"));
+        assert!(!second.contains("source: session-hit"));
+
+        let count_only = handle_search(
+            &json!({"queries": ["panic exception"], "profile": "debug", "count_only": true}),
+            &test_config(),
+            &store,
+            &session_store,
+            Some(&ks),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&count_only).unwrap();
+        assert_eq!(v["memory_applied"], true);
+        assert_eq!(v["sources_matched"], json!(["demo"]));
     }
 
     #[test]
